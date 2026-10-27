@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -52,6 +52,8 @@ class ReplayEngine:
         speed: float = 1.0,
         tick_interval: float = 2.5,
         on_tick: TickCallback | None = None,
+        stop_event: threading.Event | None = None,
+        config_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         if speed <= 0:
             raise ValueError("speed must be greater than zero")
@@ -62,6 +64,8 @@ class ReplayEngine:
         self.speed = speed
         self.tick_interval = tick_interval
         self.on_tick = on_tick
+        self.stop_event = stop_event or threading.Event()
+        self.config_provider = config_provider
         self.tick_results: list[dict[str, Any]] = []
 
     def run(
@@ -84,8 +88,12 @@ class ReplayEngine:
         for dataset in dataset_list:
             records = self._ordered_records(dataset, timeline_offset)
             for timestamp, kind, value in records:
+                if self.stop_event.is_set():
+                    break
                 if last_timestamp is not None and timestamp > last_timestamp:
-                    time.sleep((timestamp - last_timestamp) / self.speed)
+                    delay = (timestamp - last_timestamp) / self.speed
+                    if self.stop_event.wait(delay):
+                        break
                 last_timestamp = timestamp
                 if kind == "event":
                     ingest(self.state, event=value)
@@ -101,10 +109,13 @@ class ReplayEngine:
                     )
                     next_tick_minute = self.state.minute + self.tick_interval
 
-            if records:
+            if records and not self.stop_event.is_set():
                 timeline_offset = max(timestamp for timestamp, _, _ in records)
 
-        if not self.tick_results or self.tick_results[-1]["minute"] < round(self.state.minute, 2):
+        if (
+            not self.stop_event.is_set()
+            and (not self.tick_results or self.tick_results[-1]["minute"] < round(self.state.minute, 2))
+        ):
             self._tick(
                 mode=mode,
                 language=language,
@@ -121,6 +132,12 @@ class ReplayEngine:
         favourite_team: str | None,
         favourite_player: str | None,
     ) -> None:
+        if self.config_provider:
+            config = self.config_provider()
+            mode = config.get("mode", mode)
+            language = config.get("language", language)
+            favourite_team = config.get("favourite_team", favourite_team)
+            favourite_player = config.get("favourite_player", favourite_player)
         result = self.orchestrator.tick(
             self.state,
             mode=mode,

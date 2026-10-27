@@ -30,7 +30,7 @@ class LLMClient:
         self.cache_dir = (
             Path(configured_cache)
             if configured_cache
-            else Path.home() / ".cache" / "galadriel-mirror" / "llm"
+            else Path.home() / ".cache" / "overseer" / "llm"
         )
 
     def complete(

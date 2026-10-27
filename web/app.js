@@ -1,0 +1,512 @@
+(() => {
+  "use strict";
+
+  const $ = (selector) => document.querySelector(selector);
+  const pitch = $("#pitch");
+  const pitchContext = pitch.getContext("2d");
+  const chart = $("#momentum-chart");
+  const chartContext = chart.getContext("2d");
+  const TEAM_COLORS = { Rovers: "#b6f35b", United: "#f0a66c" };
+  const state = {
+    events: [],
+    frame: null,
+    shape: {},
+    patterns: {},
+    impact: [],
+    momentum: [],
+    moments: [],
+    selectedEvent: null,
+    selectedClip: null,
+    spotlight: null,
+    objectUrl: null,
+    toastTimer: null
+  };
+
+  function showToast(message) {
+    const toast = $("#toast");
+    toast.textContent = message;
+    toast.classList.add("visible");
+    clearTimeout(state.toastTimer);
+    state.toastTimer = setTimeout(() => toast.classList.remove("visible"), 3200);
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = data.detail || `Request failed (${response.status})`;
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    return data;
+  }
+
+  function resizeCanvas(canvas, context) {
+    const rect = canvas.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.max(1, Math.round(rect.width * ratio));
+    canvas.height = Math.max(1, Math.round(rect.height * ratio));
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    return { width: rect.width, height: rect.height };
+  }
+
+  function drawPitch() {
+    const { width, height } = resizeCanvas(pitch, pitchContext);
+    const ctx = pitchContext;
+    const pad = 12;
+    const left = pad, top = pad, right = width - pad, bottom = height - pad;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#183222";
+    ctx.fillRect(left, top, right - left, bottom - top);
+    ctx.strokeStyle = "#80a38476";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(left, top, right - left, bottom - top);
+    ctx.beginPath();
+    ctx.moveTo((left + right) / 2, top);
+    ctx.lineTo((left + right) / 2, bottom);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc((left + right) / 2, (top + bottom) / 2, (bottom - top) * 0.13, 0, Math.PI * 2);
+    ctx.stroke();
+    const boxHeight = (bottom - top) * 0.48;
+    const boxWidth = (right - left) * 0.16;
+    ctx.strokeRect(left, (top + bottom - boxHeight) / 2, boxWidth, boxHeight);
+    ctx.strokeRect(right - boxWidth, (top + bottom - boxHeight) / 2, boxWidth, boxHeight);
+
+    const teams = state.shape.teams || {};
+    for (const [team, teamData] of Object.entries(teams)) {
+      const summary = teamData.out_of_possession;
+      if (!summary || !Number.isFinite(summary.line_height)) continue;
+      const x = team === "Rovers" ? summary.line_height : 100 - summary.line_height;
+      ctx.setLineDash([4, 5]);
+      ctx.strokeStyle = `${TEAM_COLORS[team]}70`;
+      ctx.beginPath();
+      ctx.moveTo(left + (x / 100) * (right - left), top);
+      ctx.lineTo(left + (x / 100) * (right - left), bottom);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    const frame = state.frame;
+    if (frame) {
+      $("#pitch-empty").hidden = true;
+      $("#possession-label").textContent = `POSSESSION ${frame.poss ? frame.poss.toUpperCase() : "—"}`;
+      const ball = frame.ball || {};
+      const ballX = left + (Number(ball.x || 0) / 100) * (right - left);
+      const ballY = top + (Number(ball.y || 0) / 100) * (bottom - top);
+      let closestSpotlightId = null;
+      if (state.spotlight?.player && state.selectedEvent?.x != null) {
+        let closestDistance = Infinity;
+        for (const candidate of frame.players || []) {
+          if (candidate.team !== state.selectedEvent.team) continue;
+          const dx = Number(candidate.x) - Number(state.selectedEvent.x);
+          const dy = Number(candidate.y) - Number(state.selectedEvent.y);
+          const distance = dx * dx + dy * dy;
+          if (distance < closestDistance) {
+            closestDistance = distance;
+            closestSpotlightId = candidate.id;
+          }
+        }
+      }
+      for (const player of frame.players || []) {
+        const x = left + (Number(player.x || 0) / 100) * (right - left);
+        const y = top + (Number(player.y || 0) / 100) * (bottom - top);
+        const isSpotlight = state.spotlight && (
+          player.id === state.spotlight.id || player.id === closestSpotlightId
+        );
+        ctx.beginPath();
+        ctx.arc(x, y, isSpotlight ? 6 : player.role === "GK" ? 3.2 : 4.1, 0, Math.PI * 2);
+        ctx.fillStyle = TEAM_COLORS[player.team] || "#ddd";
+        ctx.fill();
+        ctx.strokeStyle = isSpotlight ? "#ffffff" : "#101810";
+        ctx.lineWidth = isSpotlight ? 2 : 1;
+        ctx.stroke();
+        if (isSpotlight) {
+          ctx.beginPath();
+          ctx.arc(x, y, 10, 0, Math.PI * 2);
+          ctx.strokeStyle = "#ffffffa0";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
+      ctx.beginPath();
+      ctx.arc(ballX, ballY, 4.2, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowColor = "#ffffff";
+      ctx.shadowBlur = 7;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    drawSpotlightPath(left, right, top, bottom);
+  }
+
+  function drawSpotlightPath(left, right, top, bottom) {
+    if (!state.spotlight || !state.selectedEvent) return;
+    const player = state.spotlight;
+    const related = state.events.filter((event) =>
+      event.player === player && event.x != null && Math.abs(event.minute - state.selectedEvent.minute) <= 1
+    );
+    if (related.length < 2) return;
+    const ctx = pitchContext;
+    ctx.beginPath();
+    related.forEach((event, index) => {
+      const x = left + (Number(event.x) / 100) * (right - left);
+      const y = top + (Number(event.y) / 100) * (bottom - top);
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = "#ffffffb0";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawMomentum() {
+    const { width, height } = resizeCanvas(chart, chartContext);
+    const ctx = chartContext;
+    const pad = { left: 7, right: 7, top: 8, bottom: 8 };
+    const chartWidth = width - pad.left - pad.right;
+    const chartHeight = height - pad.top - pad.bottom;
+    const mid = pad.top + chartHeight / 2;
+    ctx.clearRect(0, 0, width, height);
+    ctx.strokeStyle = "#465148";
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, mid);
+    ctx.lineTo(width - pad.right, mid);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (!state.momentum.length) return;
+    const points = state.momentum.map((item, index) => ({
+      x: pad.left + (state.momentum.length === 1 ? chartWidth / 2 : (index / (state.momentum.length - 1)) * chartWidth),
+      y: pad.top + ((1 - Math.max(-1, Math.min(1, Number(item.value)))) / 2) * chartHeight
+    }));
+    ctx.beginPath();
+    points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#b6f35b";
+    ctx.stroke();
+    points.forEach((point) => {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 2, 0, Math.PI * 2);
+      ctx.fillStyle = "#d7ff9f";
+      ctx.fill();
+    });
+  }
+
+  function renderScore(data) {
+    const score = data.score || {};
+    $("#score").innerHTML = `${score.Rovers || 0} <span>—</span> ${score.United || 0}`;
+    $("#minute").textContent = Number(data.minute || 0).toFixed(2);
+    $("#match-status").textContent = String(data.status || "READY").toUpperCase();
+    $("#source-label").textContent = `${String(data.source || "synthetic").toUpperCase()} DATA`;
+    $("#start-button").disabled = data.status === "running" || data.status === "starting";
+    $("#stop-button").disabled = !["running", "starting"].includes(data.status);
+  }
+
+  function renderEvents() {
+    const log = $("#event-log");
+    const events = state.events.slice(-45).reverse();
+    if (!events.length) {
+      log.innerHTML = '<p class="empty-note">Events will appear here as the match unfolds.</p>';
+      return;
+    }
+    log.innerHTML = events.map((event) => {
+      const key = `${event.minute}-${event.team}-${event.player}-${event.type}`;
+      const selected = state.selectedEvent && state.selectedEvent.key === key ? " selected" : "";
+      const symbol = event.outcome === "goal" ? "⚽" : event.type === "shot" ? "◉" : event.type === "tackle" ? "◇" : "·";
+      const description = event.type === "shot" && event.outcome === "goal"
+        ? `<strong>${escapeHtml(event.player)}</strong> scores`
+        : `<strong>${escapeHtml(event.player)}</strong> ${escapeHtml(event.type)}${event.outcome ? ` · ${escapeHtml(event.outcome.replaceAll("_", " "))}` : ""}`;
+      return `<button class="event-row${selected}" data-event-key="${escapeHtml(key)}" type="button">
+        <span class="event-time">${Number(event.minute || 0).toFixed(1)}'</span>
+        <span class="event-symbol ${event.team === "United" ? "united" : ""}">${symbol}</span>
+        <span class="event-desc">${description}</span>
+        <span class="event-tag">${escapeHtml(event.team || "")}</span>
+      </button>`;
+    }).join("");
+    log.querySelectorAll(".event-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const event = events.find((item) => `${item.minute}-${item.team}-${item.player}-${item.type}` === row.dataset.eventKey);
+        selectEvent(event);
+      });
+    });
+  }
+
+  function renderShape(shapeData) {
+    const container = $("#shape-card");
+    const teams = shapeData.teams || {};
+    const content = Object.entries(teams).map(([team, value]) => {
+      const formation = value.out_of_possession?.formation || "—";
+      const block = value.block?.block || "—";
+      const marking = value.marking?.style || "—";
+      return `<div class="team-insight"><b>${escapeHtml(team)}</b><span>${escapeHtml(formation)} · ${escapeHtml(block)} · ${escapeHtml(marking)}</span></div>`;
+    }).join("");
+    container.innerHTML = content || '<p class="muted">Waiting for match data…</p>';
+  }
+
+  function renderPatterns(patternData) {
+    const findings = patternData.findings || {};
+    const container = $("#pattern-card");
+    const entries = Object.entries(findings);
+    if (!entries.length) {
+      container.innerHTML = '<p class="muted">No flagged patterns in the current window.</p>';
+      return;
+    }
+    container.innerHTML = entries.slice(0, 7).map(([name, finding]) => {
+      let text = "";
+      if (name.includes("flank")) text = `${finding.top_share ? Math.round(finding.top_share * 100) : 0}% pass/shot share · ${finding.top_flank}`;
+      else if (name.includes("reliance")) text = `${escapeHtml(finding.top_player || "Player")} · ${Math.round(finding.share * 100)}% involvement`;
+      else if (name.includes("turnover")) text = `${escapeHtml(finding.zone || "—")} · ${Math.round(finding.share * 100)}%`;
+      else if (name.includes("press_trigger")) {
+        const trigger = finding.best_trigger;
+        text = `${escapeHtml(trigger || "—")} · ${Math.round((finding.triggers?.[trigger]?.rate || 0) * 100)}% press rate`;
+      }
+      return `<div class="pattern-line"><strong>${escapeHtml(name.replaceAll("_", " "))}</strong><br>${text}</div>`;
+    }).join("");
+  }
+
+  function renderImpact(impact) {
+    const container = $("#impact-card");
+    if (!impact || !impact.length) {
+      container.innerHTML = '<p class="muted">Waiting for match data…</p>';
+      return;
+    }
+    const top = impact.slice(0, 5);
+    container.innerHTML = top.map((player) => `<div class="impact-row">
+      <span>${escapeHtml(player.player)}</span>
+      <span class="impact-bar"><i style="width:${Math.max(0, Math.min(100, player.score))}%"></i></span>
+      <span class="impact-score">${Number(player.score).toFixed(0)}</span>
+    </div>`).join("");
+  }
+
+  function renderNarration(narration) {
+    if (!narration) return;
+    $("#narration-text").textContent = narration.text || "";
+    $("#narration-minute").textContent = `${Number(narration.minute || 0).toFixed(1)}'`;
+    $("#mock-badge").classList.toggle("hidden", !narration.mock);
+  }
+
+  function renderMoments(moments) {
+    const container = $("#insight-popups");
+    const latest = (moments || []).slice(-3);
+    container.innerHTML = latest.map((moment) => `<button class="insight-chip" type="button" title="${escapeHtml(moment.why || "")}" data-moment-id="${escapeHtml(moment.id)}">${escapeHtml(String(moment.type || "insight").replaceAll("_", " "))} · ${Number(moment.minute || 0).toFixed(0)}'</button>`).join("");
+    container.querySelectorAll(".insight-chip").forEach((button) => {
+      button.addEventListener("click", () => {
+        const moment = latest.find((item) => item.id === button.dataset.momentId);
+        if (moment) replayMoment(moment);
+      });
+    });
+  }
+
+  function render(snapshot) {
+    renderScore(snapshot);
+    if (snapshot.events) state.events = snapshot.events;
+    if (snapshot.frame !== undefined) state.frame = snapshot.frame;
+    if (snapshot.shape) state.shape = snapshot.shape;
+    if (snapshot.patterns) state.patterns = snapshot.patterns;
+    if (snapshot.impact) state.impact = snapshot.impact;
+    if (snapshot.momentum_series) state.momentum = snapshot.momentum_series;
+    if (snapshot.moments) state.moments = snapshot.moments;
+    if (snapshot.narration) renderNarration(snapshot.narration);
+    renderShape(state.shape);
+    renderPatterns(state.patterns);
+    renderImpact(state.impact);
+    renderMoments(state.moments);
+    renderEvents();
+    drawPitch();
+    drawMomentum();
+    updatePlayerOptions(state.events);
+    $("#fan-panel").hidden = $("#mode").value !== "Fan";
+    if (snapshot.error) showToast(snapshot.error);
+  }
+
+  function updatePlayerOptions(events) {
+    const select = $("#favourite-player");
+    const current = select.value;
+    const players = [...new Set(events.map((event) => event.player).filter(Boolean))].sort();
+    const options = ['<option value="">Any player</option>', ...players.map((player) =>
+      `<option value="${escapeHtml(player)}">${escapeHtml(player)}</option>`
+    )];
+    select.innerHTML = options.join("");
+    if (players.includes(current)) select.value = current;
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[char]);
+  }
+
+  async function sendControl(action = null) {
+    const payload = {
+      speed: Number($("#speed").value),
+      mode: $("#mode").value,
+      language: $("#language").value,
+      favourite_team: $("#favourite-team").value,
+      favourite_player: $("#favourite-player").value || null
+    };
+    if (action) payload.action = action;
+    const result = await api("/control", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    render(result);
+    return result;
+  }
+
+  function selectEvent(event) {
+    if (!event) return;
+    state.selectedEvent = {
+      ...event,
+      key: `${event.minute}-${event.team}-${event.player}-${event.type}`
+    };
+    state.selectedClip = event;
+    state.spotlight = event.player ? { player: event.player } : null;
+    $("#replay-button").disabled = false;
+    renderEvents();
+    drawPitch();
+    $("#spotlight-label").textContent = event.player ? `SPOTLIGHT · ${event.player.toUpperCase()}` : "NO PLAYER SPOTLIGHT";
+    const timeParameter = event.t == null ? "" : `&t=${encodeURIComponent(event.t)}`;
+    api(`/frame?minute=${encodeURIComponent(event.minute || 0)}${timeParameter}`)
+      .then((result) => {
+        if (state.selectedEvent?.key !== `${event.minute}-${event.team}-${event.player}-${event.type}`) return;
+        state.frame = result.frame;
+        drawPitch();
+      })
+      .catch((error) => {
+        if (!/No replay frames/.test(error.message)) showToast(error.message);
+      });
+  }
+
+  function seekVideo(event) {
+    const video = $("#video");
+    if (!video.classList.contains("loaded") || event.t == null) return;
+    video.currentTime = Math.max(0, Number(event.t));
+    const playResult = video.play();
+    if (playResult && typeof playResult.catch === "function") playResult.catch(() => {});
+  }
+
+  function replayMoment(moment) {
+    const matchEvent = state.events.find((event) =>
+      Math.abs(Number(event.minute) - Number(moment.minute)) < 0.1 &&
+      (!moment.team || event.team === moment.team) &&
+      (moment.type !== "goal" || event.outcome === "goal")
+    );
+    if (matchEvent) {
+      selectEvent(matchEvent);
+      seekVideo(matchEvent);
+    } else {
+      state.selectedEvent = {
+        ...moment,
+        minute: Number(moment.minute || 0),
+        key: moment.id,
+        player: moment.player || null
+      };
+      state.spotlight = moment.player ? { player: moment.player } : null;
+      drawPitch();
+      $("#spotlight-label").textContent = moment.player
+        ? `SPOTLIGHT · ${moment.player.toUpperCase()}`
+        : `MOMENT · ${String(moment.type || "").replaceAll("_", " ").toUpperCase()}`;
+      api(`/frame?minute=${encodeURIComponent(moment.minute || 0)}`)
+        .then((result) => {
+          if (state.selectedEvent?.key !== moment.id) return;
+          state.frame = result.frame;
+          drawPitch();
+        })
+        .catch((error) => {
+          if (!/No replay frames/.test(error.message)) showToast(error.message);
+        });
+    }
+    showToast(moment.why || `Replaying ${moment.type || "match moment"}`);
+  }
+
+  async function runFanQuery(query) {
+    const result = await api("/fan-query", {
+      method: "POST",
+      body: JSON.stringify({ query })
+    });
+    $("#fan-result").textContent = `${result.count} matching event${result.count === 1 ? "" : "s"} · ${result.compiled_by} filter`;
+    const clips = $("#fan-clips");
+    clips.innerHTML = result.clips.slice(0, 12).map((clip, index) =>
+      `<button class="fan-clip" type="button" data-index="${index}">
+        <span>${Number(clip.minute || 0).toFixed(1)}' · ${escapeHtml(clip.player || "Unknown")} · ${escapeHtml(clip.type)}</span>
+        <span>${escapeHtml(clip.team || "")} ›</span>
+      </button>`
+    ).join("");
+    clips.querySelectorAll(".fan-clip").forEach((button) => {
+      button.addEventListener("click", () => {
+        const clip = result.clips[Number(button.dataset.index)];
+        selectEvent(clip.event);
+        seekVideo(clip.event);
+      });
+    });
+    if (result.count && result.clips[0]) {
+      selectEvent(result.clips[0].event);
+      seekVideo(result.clips[0].event);
+    }
+    $("#fan-panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function connectStream() {
+    const stream = new EventSource("/stream");
+    stream.onopen = () => {
+      $("#connection-label").textContent = "CONNECTED";
+      $("#connection-label").previousElementSibling.style.background = "#b6f35b";
+    };
+    stream.onmessage = (event) => {
+      try {
+        render(JSON.parse(event.data));
+      } catch (error) {
+        console.error("Could not parse match stream update", error);
+      }
+    };
+    stream.onerror = () => {
+      $("#connection-label").textContent = "RECONNECTING";
+    };
+  }
+
+  $("#start-button").addEventListener("click", async () => {
+    try { await sendControl("start"); } catch (error) { showToast(error.message); }
+  });
+  $("#stop-button").addEventListener("click", async () => {
+    try { await sendControl("stop"); } catch (error) { showToast(error.message); }
+  });
+  for (const id of ["speed", "mode", "language", "favourite-team", "favourite-player"]) {
+    $(`#${id}`).addEventListener("change", async () => {
+      if (id === "mode") $("#fan-panel").hidden = $("#mode").value !== "Fan";
+      try { await sendControl(); } catch (error) { showToast(error.message); }
+    });
+  }
+  $("#replay-button").addEventListener("click", () => {
+    if (state.selectedEvent) {
+      selectEvent(state.selectedEvent);
+      seekVideo(state.selectedEvent);
+    }
+  });
+  $("#fan-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const query = $("#fan-query").value.trim();
+    if (!query) return;
+    try { await runFanQuery(query); } catch (error) { showToast(error.message); }
+  });
+  $("#video-file").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const video = $("#video");
+    if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
+    state.objectUrl = URL.createObjectURL(file);
+    video.src = state.objectUrl;
+    video.classList.add("loaded");
+    $("#video-empty").hidden = true;
+    showToast(`Loaded local clip: ${file.name}`);
+  });
+  window.addEventListener("resize", () => { drawPitch(); drawMomentum(); });
+
+  connectStream();
+  $("#fan-panel").hidden = $("#mode").value !== "Fan";
+  api("/state").then(render).catch((error) => showToast(error.message));
+})();

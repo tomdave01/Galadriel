@@ -1,4 +1,4 @@
-"""Plain-Python agents for Galadriel's Mirror."""
+"""Plain-Python agents for Overseer."""
 
 from agents.analysts import ImpactAnalyst, MomentDetector, PatternSpotter, ShapeAnalyst
 from agents.fan_curator import FanCurator

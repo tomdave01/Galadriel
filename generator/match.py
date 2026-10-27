@@ -1,4 +1,4 @@
-"""Reproducible synthetic match data for Galadriel's Mirror."""
+"""Reproducible synthetic match data for Overseer."""
 
 from __future__ import annotations
 

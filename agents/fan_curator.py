@@ -23,7 +23,7 @@ class FanCurator:
 
         matches = [
             event for event in state.events
-            if self._matches(event, filters)
+            if filters and self._matches(event, filters)
         ]
         clips = [
             {
