@@ -29,7 +29,9 @@ and serves a transparent browser-source page. The current match-control and
 dashboard state source uses the replay adapter when Event Hubs is not configured.
 When `EVENTHUB_NAMESPACE` is set, the API starts the ordered feed processor and
 publishes snapshots and overlays from ingested match data. Azure deployment
-automation remains Phase 4 work.
+automation is provided by `infra/deploy.sh`. The deployed processor/API is
+single-replica because `MatchState` is held in memory; Cosmos DB stores
+snapshots and narration cache records, not a distributed live state lock.
 
 ## Azure resources and configuration
 
@@ -49,6 +51,83 @@ configuration store. Do not commit credentials. Event Hubs, Cosmos DB, Foundry,
 and Translator use `DefaultAzureCredential`. A Foundry-only API-key fallback
 is supported through `FOUNDRY_API_KEY` if Entra authentication is unavailable;
 its project-endpoint header behavior requires manual verification.
+
+## Azure deployment
+
+`infra/deploy.sh` provisions the Azure resources and deploys the API/processor
+container and the Static Web App. It expects a Bash-capable host (Linux, macOS,
+WSL, or Git Bash), Azure CLI already logged into the target subscription, plus
+`npx`, `python3`, and `curl`. Create a Foundry project and model deployment
+first; the script requires its project endpoint, model name, and Foundry
+resource ID. The script does not create or deploy the Foundry project/model.
+
+From the repository root, configure the environment from a private `.env`
+file (not committed) or export these required values directly:
+
+```bash
+cp .env.example .env
+# Edit .env and set the Foundry project endpoint, deployment, and resource ID.
+set -a
+source .env
+set +a
+export FOUNDRY_PROJECT_ENDPOINT="https://<your-foundry-project-endpoint>"
+export FOUNDRY_MODEL="<your-model-deployment>"
+export FOUNDRY_RESOURCE_ID="<your-foundry-resource-id>"
+bash infra/deploy.sh
+```
+
+`.env.example` lists supported runtime and deployment overrides. The script
+creates a resource group, Log Analytics workspace, Application Insights
+resource, Basic Event Hubs namespace and hub, serverless Cosmos DB account and
+containers, Basic Container Registry, Container Apps environment, the
+single-replica API/processor, a manual-trigger simulator Container Apps Job,
+and a Static Web App. It grants managed identities Event Hubs and Cosmos data
+access, ACR image-pull access, and the configured Foundry role. The API URL is
+injected into the staged web `config.js` during Static Web Apps deployment.
+The deployment uses ACR Tasks to build the Docker image; a local Docker daemon
+is not required.
+
+After deployment, the script prints the API, Static Web App, and browser-source
+URLs. Start synthetic feed publishing with the printed job command:
+
+```bash
+az containerapp job start --resource-group <printed-resource-group> --name <printed-simulator-job>
+```
+
+The simulator job uses a system-assigned identity with Event Hubs Data Sender
+permission. For a live production broadcast, replace the simulator with a
+feed adapter publishing the same ordered envelope format; do not treat
+synthetic events as broadcast observations.
+
+### Cost and responsible AI
+
+Costs are driven by always-on Container Apps compute, Application Insights and
+Log Analytics ingestion/retention, Event Hubs throughput, Cosmos DB request
+units and stored data, model inference, Container Registry storage/builds, and
+Static Web Apps usage. The simulator Job incurs compute only while running.
+Basic Event Hubs and free Static Web Apps are starting-tier defaults, not
+capacity or production recommendations; verify quotas, availability, pricing,
+and failover requirements for the target region and match workload.
+
+Synthetic data is visibly labelled in the dashboard and must not be presented
+as live match evidence. Narration is grounded only in supplied deterministic
+facts; fallback templates keep overlays flowing when model calls time out.
+Tracing carries fact identifiers for claim lineage. Content Safety is an
+optional disabled-by-default guard and is not a substitute for editorial
+review.
+
+### Needs manual verification before production
+
+- Confirm the Foundry User role and its assignment scope for the target tenant,
+  project, and model deployment.
+- Confirm deployment-region availability, pricing, Basic-tier quotas, and
+  throughput for Event Hubs, Cosmos DB, Container Apps, and Static Web Apps.
+- Validate the managed-identity Foundry token path and the optional API-key
+  fallback against the actual Foundry project endpoint.
+- Exercise the script, RBAC propagation, ACR Tasks, Container Apps Job, and
+  Static Web Apps deployment in the target Azure subscription.
+- Load-test the single-replica processor, SSE fan-out, partitioning, Cosmos
+  persistence, and overlay timing with representative broadcast traffic.
 
 Current Foundry documentation uses `FOUNDRY_PROJECT_ENDPOINT` and
 `FOUNDRY_MODEL` for `FoundryChatClient`; the latter is the documented model
@@ -125,13 +204,18 @@ configured Azure resources:
 ```powershell
 python -m pip install -r requirements.txt
 az login
-python -m uvicorn api.main:app --reload
+python scripts\dev_run.py --reload
 ```
 
-This command runs the current replay-oriented dashboard for development; it is
-not the production live-feed deployment path. In Azure, use a managed identity
-instead of developer credentials. Configure `CORS_ALLOWED_ORIGINS` with the
-exact Static Web App origin when deploying the browser client.
+Set `EVENTHUB_NAMESPACE`, `COSMOS_ENDPOINT`, `FOUNDRY_PROJECT_ENDPOINT`, and
+`FOUNDRY_MODEL` from your Azure resources before running the script. It starts
+the API, which starts its live Event Hubs processor as part of application
+startup; it does not start a local feed emulator. Use the Azure simulator Job
+or an external feed adapter to publish messages. This laptop command is a
+developer convenience, not the production deployment path. In Azure, use a
+managed identity instead of developer credentials. Configure
+`CORS_ALLOWED_ORIGINS` with the exact Static Web App origin when deploying the
+browser client.
 
 ## Deterministic analysis validation
 
