@@ -19,14 +19,17 @@ flowchart LR
     Agents --> Foundry["Microsoft Foundry model deployment"]
     Processor --> Cosmos["Azure Cosmos DB snapshots and narration cache"]
     Agents --> Insights["Application Insights / OpenTelemetry"]
-    Facts --> Overlay["Timecoded overlay API and browser source (Phase 3)"]
+    Facts --> Overlay["Timecoded overlay API and transparent browser source"]
 ```
 
 The feed package, sequence handling, Cosmos persistence interfaces, deterministic
-analysis, and Foundry-backed agent layer are implemented. The current dashboard
-still uses the replay adapter; Phase 3 will switch the browser UI to overlay
-JSON and connect it to the live processor. Azure deployment automation and the
-broadcast overlay page are part of Phase 4.
+analysis, and Foundry-backed agent layer are implemented. The API now publishes
+validated overlay JSON through SSE, retains recent overlays for late joiners,
+and serves a transparent browser-source page. The current match-control and
+dashboard state source uses the replay adapter when Event Hubs is not configured.
+When `EVENTHUB_NAMESPACE` is set, the API starts the ordered feed processor and
+publishes snapshots and overlays from ingested match data. Azure deployment
+automation remains Phase 4 work.
 
 ## Azure resources and configuration
 
@@ -88,6 +91,32 @@ Agent and deterministic tool spans include names, fact IDs, and latency.
 `APPLICATIONINSIGHTS_CONNECTION_STRING` enables Azure Monitor export. Narration
 prompts and raw player/frame payloads are not added as span attributes.
 
+## Overlay output and browser source
+
+The API validates every broadcast message against one Pydantic schema before
+publishing it. `GET /stream` sends state snapshots as normal SSE messages and
+overlay JSON as named `overlay` events. `GET /overlays/recent?limit=100`
+returns overlays whose broadcast duration is still active, for clients joining
+mid-match. Each overlay
+includes a monotonic sequence, match clock/timecode, duration, priority,
+language/mode, fact lineage, and optional statistics/player/team/pitch
+markings.
+
+Open `/overlay` as a transparent 1920×1080 browser source in OBS. The renderer
+loads recent overlay JSON, then follows SSE snapshots for match-clock timing
+and overlay events for priority-sorted cards and pitch markings. Dashboard
+configuration lives in `web/config.js` (`OVERSEER_API_BASE_URL`). When the
+Static Web App and API use different origins, set `CORS_ALLOWED_ORIGINS` to the
+exact Static Web App origin(s); wildcard CORS is rejected.
+Setting `WEB_PUBSUB_CONNECTION` enables an additional Azure Web PubSub fan-out
+using `WEB_PUBSUB_HUB`; SSE remains enabled as the default transport.
+
+The dashboard displays the latest overlay and its raw JSON alongside the
+rendered preview. Its synthetic-data badge remains visible, and the latency
+indicator reports feed-envelope `wall_time_utc` to deterministic fact-overlay
+emission when Event Hubs is active. The replay adapter uses record receipt time
+because replay records do not carry a feed envelope.
+
 ## Developer convenience: run against Azure resources
 
 The API development shell can be run on a laptop while authenticating to
@@ -102,7 +131,7 @@ python -m uvicorn api.main:app --reload
 This command runs the current replay-oriented dashboard for development; it is
 not the production live-feed deployment path. In Azure, use a managed identity
 instead of developer credentials. Configure `CORS_ALLOWED_ORIGINS` with the
-Static Web App origin when deploying the browser client.
+exact Static Web App origin when deploying the browser client.
 
 ## Deterministic analysis validation
 

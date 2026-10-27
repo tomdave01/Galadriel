@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from api.main import app, manager
+from api.overlays import OverlayHistory
 from engine.state import MatchState
 
 
@@ -13,6 +14,9 @@ def test_static_dashboard_and_state_route():
         assert "Match pitch" in page.text
         assert client.get("/app.js").status_code == 200
         assert client.get("/styles.css").status_code == 200
+        assert client.get("/overlay").status_code == 200
+        assert "transparent" in client.get("/overlay.html").text
+        assert client.get("/overlay.js").status_code == 200
         assert "OVERSEER_API_BASE_URL" in client.get("/config.js").text
         snapshot = client.get("/state")
         assert snapshot.status_code == 200
@@ -20,6 +24,7 @@ def test_static_dashboard_and_state_route():
         assert "frames" in snapshot.json()
         missing_frame = client.get("/frame?minute=1")
         assert missing_frame.status_code == 404
+        assert client.get("/overlays/recent").json() == []
 
 
 def test_clip_video_supports_byte_range_requests(tmp_path, monkeypatch):
@@ -62,6 +67,51 @@ def test_frame_lookup_uses_t_for_clip_and_minute_for_shifted_synthetic_frames():
         assert synthetic.json()["frame"]["source"] == "synthetic"
     finally:
         manager.state = original_state
+
+
+def test_fact_overlay_is_validated_and_available_to_late_joiners():
+    original_state = manager.state
+    original_history = manager.overlays
+    manager.state = MatchState(
+        minute=2.0,
+        score={"Rovers": 1, "United": 0},
+        events=[{
+            "match_id": "overlay-test",
+            "player": "Rico Vale",
+            "team": "Rovers",
+            "x": 80.0,
+            "y": 45.0,
+        }],
+    )
+    manager.overlays = OverlayHistory()
+    try:
+        manager.publish_facts_from_worker(
+            {
+                "moments": [{
+                    "id": "goal-rovers-2",
+                    "type": "goal",
+                    "team": "Rovers",
+                    "player": "Rico Vale",
+                    "why": "Rico Vale scored for Rovers.",
+                }]
+            },
+            match_clock=125.25,
+        )
+        with TestClient(app) as client:
+            response = client.get("/overlays/recent?limit=1")
+
+        assert response.status_code == 200
+        overlay = response.json()[0]
+        assert overlay["type"] == "fact"
+        assert overlay["match_id"] == "overlay-test"
+        assert overlay["seq"] == 0
+        assert overlay["match_clock"] == 125.25
+        assert overlay["start_tc"] == "00:02:05.250"
+        assert overlay["source_agent"] == "MomentDetector"
+        assert overlay["markings"][0]["kind"] == "spotlight"
+    finally:
+        manager.state = original_state
+        manager.overlays = original_history
 
 
 def test_control_preferences_and_fan_query():

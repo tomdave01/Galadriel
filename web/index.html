@@ -11,11 +11,12 @@
     <header class="topbar">
       <a class="brand" href="/" aria-label="Overseer home">
         <span class="brand-mark">GM</span>
-        <span><strong>GALADRIEL'S MIRROR</strong><small>LIVE MATCH INTELLIGENCE</small></span>
+        <span><strong>OVERSEER</strong><small>LIVE MATCH INTELLIGENCE</small></span>
       </a>
       <div class="top-meta">
         <span class="live-indicator"><i></i><span id="connection-label">CONNECTING</span></span>
         <span id="source-label" class="source-pill">SYNTHETIC DATA</span>
+        <span id="latency-label" class="latency-pill">LATENCY —</span>
       </div>
     </header>
 
@@ -100,10 +101,20 @@
 
           <section class="panel narration-panel">
             <div class="section-heading compact-heading">
-              <div><span class="eyebrow">AI COMMENTARY <span id="fallback-badge" class="fallback-badge">TEMPLATE FALLBACK</span></span><h2>Narrator</h2></div>
+              <div><span class="eyebrow">AI COMMENTARY <span id="fallback-badge" class="fallback-badge hidden">TEMPLATE FALLBACK</span></span><h2>Narrator</h2></div>
               <span class="narration-minute" id="narration-minute">—</span>
             </div>
             <p id="narration-text" class="narration-text">Start the replay for fact-grounded match commentary.</p>
+            <div class="overlay-inspector">
+              <div>
+                <span class="eyebrow">RENDERED OVERLAY</span>
+                <article id="overlay-preview" class="overlay-preview"><strong>Waiting for overlay JSON…</strong></article>
+              </div>
+              <div>
+                <span class="eyebrow">RAW OVERLAY JSON</span>
+                <pre id="overlay-json" class="overlay-json">No overlay received yet.</pre>
+              </div>
+            </div>
             <div id="insight-popups" class="insight-popups" aria-live="polite"></div>
           </section>
 

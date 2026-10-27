@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ class ReplayDataset:
 
 
 TickCallback = Callable[[dict[str, Any]], None]
+FactCallback = Callable[[dict[str, Any]], None]
 
 
 class ReplayEngine:
@@ -60,6 +62,7 @@ class ReplayEngine:
         speed: float = 1.0,
         tick_interval: float = 2.5,
         on_tick: TickCallback | None = None,
+        on_fact: FactCallback | None = None,
         stop_event: threading.Event | None = None,
         config_provider: Callable[[], dict[str, Any]] | None = None,
         on_record: Callable[[str, dict[str, Any]], None] | None = None,
@@ -73,6 +76,7 @@ class ReplayEngine:
         self.speed = speed
         self.tick_interval = tick_interval
         self.on_tick = on_tick
+        self.on_fact = on_fact
         self.stop_event = stop_event or threading.Event()
         self.config_provider = config_provider
         self.on_record = on_record
@@ -150,13 +154,33 @@ class ReplayEngine:
             language = config.get("language", language)
             favourite_team = config.get("favourite_team", favourite_team)
             favourite_player = config.get("favourite_player", favourite_player)
-        result = self.orchestrator.tick(
-            self.state,
-            mode=mode,
-            language=language,
-            favourite_team=favourite_team,
-            favourite_player=favourite_player,
-        )
+        if self.on_fact:
+            facts = self.orchestrator.analyze_facts(self.state)
+            self.on_fact(facts)
+            narration = asyncio.run(
+                self.orchestrator.narrator.narrate(
+                    self.state,
+                    mode=mode,
+                    language=language,
+                    favourite_team=favourite_team,
+                    favourite_player=favourite_player,
+                )
+            )
+            result = {
+                **facts,
+                "impact": self.state.impact,
+                "momentum_series": self.state.momentum_series,
+                "moments": self.state.moments,
+                "narration": narration,
+            }
+        else:
+            result = self.orchestrator.tick(
+                self.state,
+                mode=mode,
+                language=language,
+                favourite_team=favourite_team,
+                favourite_player=favourite_player,
+            )
         self.tick_results.append(result)
         if self.on_tick:
             self.on_tick(result)

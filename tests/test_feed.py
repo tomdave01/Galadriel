@@ -138,6 +138,21 @@ def test_key_moment_is_snapshotted_with_applied_sequence():
     assert snapshot["state"]["score"] == {"Rovers": 1, "United": 0}
 
 
+def test_processor_calls_live_update_hook_after_ordered_ingest():
+    async def run() -> list[tuple[int, int]]:
+        updates: list[tuple[int, int]] = []
+
+        async def on_update(message: FeedMessage, state: MatchState) -> None:
+            updates.append((message.seq, len(state.events)))
+
+        processor = FeedProcessor(_UnusedConsumer(), on_update=on_update)
+        await processor.process_message(_message(1))
+        await processor.process_message(_message(0))
+        return updates
+
+    assert asyncio.run(run()) == [(0, 1), (1, 2)]
+
+
 def test_unconfigured_event_hubs_uses_shared_in_process_queue(monkeypatch, caplog):
     async def run() -> None:
         monkeypatch.delenv("EVENTHUB_NAMESPACE", raising=False)

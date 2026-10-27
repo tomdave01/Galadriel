@@ -1,12 +1,14 @@
-"""Local FastAPI service and live replay manager for Overseer."""
+"""FastAPI service, live feed processor, and replay development adapter."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,13 +18,26 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.fan_curator import FanCurator
+from agents.orchestrator import Orchestrator
+from api.overlays import (
+    Overlay,
+    OverlayHistory,
+    OverlaySink,
+    WebPubSubOverlaySink,
+    match_timecode,
+    stable_fact_id,
+)
 from engine.replay import ReplayDataset, ReplayEngine, default_datasets
 from engine.state import MatchState
+from feed.clients import create_feed_consumer
+from feed.models import FeedMessage
+from feed.processor import FeedProcessor
 from telemetry import initialize_telemetry
 
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
+logger = logging.getLogger(__name__)
 
 
 class ControlRequest(BaseModel):
@@ -48,6 +63,7 @@ class ReplayManager:
         self.favourite_player: str | None = None
         self.status = "idle"
         self.error: str | None = None
+        self.match_clock = 0.0
         self._lock = threading.RLock()
         self._stop_event: threading.Event | None = None
         self._engine: ReplayEngine | None = None
@@ -55,7 +71,14 @@ class ReplayManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._subscribers: set[asyncio.Queue[str]] = set()
         self.fan_curator = FanCurator()
+        self.orchestrator = Orchestrator()
+        self.feed_processor: FeedProcessor | None = None
+        self._narration_tasks: set[asyncio.Task[None]] = set()
         self._last_video_frame_t = -1.0
+        self.overlays = OverlayHistory()
+        self._last_record_wall_time = datetime.now(timezone.utc)
+        self.overlay_latency_ms: float | None = None
+        self.webpubsub_sink: OverlaySink | None = WebPubSubOverlaySink.from_environment()
 
     def settings(self) -> dict[str, Any]:
         with self._lock:
@@ -71,6 +94,7 @@ class ReplayManager:
             state = self.state
             return {
                 "minute": round(state.minute, 2),
+                "match_clock": self.match_clock,
                 "score": dict(state.score),
                 "source": state.source,
                 "status": self.status,
@@ -81,6 +105,7 @@ class ReplayManager:
                 "favourite_player": self.favourite_player,
                 "event_count": len(state.events),
                 "frame_count": len(state.frames),
+                "overlay_latency_ms": self.overlay_latency_ms,
                 "events": [dict(event) for event in state.events[-80:]],
                 "frame": dict(state.frames[-1]) if state.frames else None,
                 "shape": dict(state.shape),
@@ -96,8 +121,266 @@ class ReplayManager:
     def publish_from_worker(self, tick: dict[str, Any]) -> None:
         if self._loop is None or self._loop.is_closed():
             return
+        narration = tick.get("narration")
+        if isinstance(narration, dict):
+            self.publish_narration_from_worker(narration)
         snapshot = self.compact_snapshot(tick)
         self._loop.call_soon_threadsafe(self._fanout, snapshot)
+
+    def publish_facts_from_worker(
+        self,
+        facts: dict[str, Any],
+        *,
+        state: MatchState | None = None,
+        match_clock: float | None = None,
+    ) -> None:
+        settings = self.settings()
+        state = state or self.state
+        match_id = (
+            str(state.events[-1].get("match_id") or "")
+            if state.events
+            else ""
+        ) or "overseer-match"
+        current_match_clock = (
+            self.match_clock if match_clock is None else max(0.0, match_clock)
+        )
+        moments = facts.get("moments")
+        fact_moments = moments if isinstance(moments, list) else []
+        if not fact_moments:
+            fact_moments = [
+                {
+                    "id": stable_fact_id("match-state", facts),
+                    "type": "match_update",
+                    "minute": state.minute,
+                    "why": (
+                        f"Rovers {state.score.get('Rovers', 0)} — "
+                        f"{state.score.get('United', 0)} United"
+                    ),
+                    "team": None,
+                    "player": None,
+                }
+            ]
+
+        for moment in fact_moments[:3]:
+            fact_id = str(moment.get("id") or stable_fact_id("fact", moment))
+            headline, body, agent_name = self._fact_copy(moment, state)
+            markings = []
+            event = next(
+                (
+                    item
+                    for item in reversed(state.events)
+                    if item.get("player") == moment.get("player")
+                    and item.get("x") is not None
+                    and item.get("y") is not None
+                ),
+                None,
+            )
+            if event is not None:
+                markings = [{
+                    "kind": "spotlight",
+                    "points": [{"x": event["x"], "y": event["y"]}],
+                }]
+            overlay = self.overlays.add({
+                "type": "fact",
+                "match_id": match_id,
+                "match_clock": current_match_clock,
+                "start_tc": match_timecode(current_match_clock),
+                "duration_ms": 8_000,
+                "priority": 80 if moment.get("type") == "goal" else 50,
+                "mode": settings["mode"],
+                "language": settings["language"],
+                "headline": headline,
+                "body": body,
+                "stat": {
+                    "label": "Score",
+                    "value": (
+                        f"{state.score.get('Rovers', 0)} — "
+                        f"{state.score.get('United', 0)}"
+                    ),
+                },
+                "player": moment.get("player"),
+                "team": moment.get("team"),
+                "markings": markings,
+                "source_agent": agent_name,
+                "fact_ids": [fact_id],
+            })
+            self._publish_overlay(overlay)
+
+        self._update_overlay_latency()
+        if self._loop is not None and not self._loop.is_closed():
+            snapshot = self.compact_snapshot({"facts": facts})
+            self._loop.call_soon_threadsafe(self._fanout, snapshot)
+
+    @staticmethod
+    def _fact_copy(moment: dict[str, Any], state: MatchState) -> tuple[str, str, str]:
+        moment_type = str(moment.get("type", ""))
+        team = str(moment.get("team") or "")
+        player = str(moment.get("player") or "")
+        why = str(moment.get("why") or "")
+        if moment_type == "goal":
+            club = team or "their side"
+            name = player or (f"A {club} player" if team else "A player")
+            return f"GOAL · {name}", f"{name} scores for {club}.", "MomentDetector"
+        if moment_type == "momentum_swing":
+            return "Momentum shift", why, "ImpactAnalyst"
+        if moment_type in {"formation_change", "block_change"}:
+            return "Tactical shape change", why, "ShapeAnalyst"
+        return (
+            f"Match update · {state.minute:.1f}'",
+            why or f"Rovers {state.score.get('Rovers', 0)} — {state.score.get('United', 0)} United",
+            "Orchestrator",
+        )
+
+    def publish_narration_from_worker(
+        self,
+        narration: dict[str, Any],
+        *,
+        state: MatchState | None = None,
+        match_clock: float | None = None,
+    ) -> None:
+        state = state or self.state
+        current_match_clock = (
+            self.match_clock if match_clock is None else max(0.0, match_clock)
+        )
+        overlay = self.overlays.add({
+            "type": "narration",
+            "match_id": (
+                str(state.events[-1].get("match_id") or "")
+                if state.events
+                else ""
+            ) or "overseer-match",
+            "match_clock": current_match_clock,
+            "start_tc": match_timecode(current_match_clock),
+            "duration_ms": 9_000,
+            "priority": 40,
+            "mode": narration.get("mode", self.mode),
+            "language": narration.get("language", self.language),
+            "headline": (
+                "Template fallback"
+                if narration.get("fallback")
+                else "Match commentary"
+            ),
+            "body": str(narration.get("text") or ""),
+            "player": narration.get("facts", {}).get("selected_player"),
+            "team": narration.get("favourite_team"),
+            "source_agent": "Narrator",
+            "fact_ids": [str(narration.get("fact_id") or "narration")],
+        })
+        self._publish_overlay(overlay)
+
+    async def on_feed_update(
+        self,
+        message: FeedMessage,
+        state: MatchState,
+    ) -> None:
+        self.state = state
+        self.status = "live"
+        self.match_clock = message.match_clock
+        self._last_record_wall_time = datetime.fromisoformat(
+            message.wall_time_utc.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        self._fanout(self.compact_snapshot())
+        if message.kind != "event":
+            return
+
+        facts = await asyncio.to_thread(self.orchestrator.analyze_facts, state)
+        self.publish_facts_from_worker(
+            facts,
+            state=state,
+            match_clock=message.match_clock,
+        )
+        settings = self.settings()
+        task = asyncio.create_task(
+            self._narrate_live_update(state, settings, message.match_clock)
+        )
+        self._narration_tasks.add(task)
+        task.add_done_callback(self._finish_narration_task)
+
+    async def _narrate_live_update(
+        self,
+        state: MatchState,
+        settings: dict[str, Any],
+        match_clock: float,
+    ) -> None:
+        narration = await self.orchestrator.narrator.narrate(
+            state,
+            mode=settings["mode"],
+            language=settings["language"],
+            favourite_team=settings["favourite_team"],
+            favourite_player=settings["favourite_player"],
+        )
+        self.publish_narration_from_worker(
+            narration,
+            state=state,
+            match_clock=match_clock,
+        )
+        self._fanout(self.compact_snapshot())
+
+    def _finish_narration_task(self, task: asyncio.Task[None]) -> None:
+        self._narration_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Live Narrator task failed (%s)",
+                error.__class__.__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def _publish_overlay(self, overlay: Overlay) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        payload = json.dumps(
+            overlay.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._loop.call_soon_threadsafe(self._fanout_message, f"event: overlay\ndata: {payload}\n\n")
+        if self.webpubsub_sink is not None:
+            self._loop.call_soon_threadsafe(self._schedule_webpubsub_publish, overlay)
+
+    def _schedule_webpubsub_publish(self, overlay: Overlay) -> None:
+        sink = self.webpubsub_sink
+        if sink is None:
+            return
+        task = asyncio.create_task(sink.publish(overlay))
+
+        def log_publish_failure(completed: asyncio.Task[None]) -> None:
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "Web PubSub overlay publish failed (%s)",
+                    error.__class__.__name__,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(log_publish_failure)
+
+    async def close_overlay_sink(self) -> None:
+        if self.webpubsub_sink is not None:
+            await self.webpubsub_sink.close()
+            self.webpubsub_sink = None
+
+    def _update_overlay_latency(self) -> None:
+        self.overlay_latency_ms = max(
+            0.0,
+            (datetime.now(timezone.utc) - self._last_record_wall_time).total_seconds() * 1000,
+        )
+
+    def _fanout_message(self, message: str) -> None:
+        for queue in tuple(self._subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
 
     def _fanout(self, snapshot: dict[str, Any]) -> None:
         payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -113,18 +396,27 @@ class ReplayManager:
                 pass
 
     async def start(self) -> None:
+        if self.feed_processor is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Replay controls are unavailable while the live feed is active",
+            )
         if self._task and not self._task.done():
             raise HTTPException(status_code=409, detail="Replay is already running")
         self.state = MatchState()
         self.error = None
+        self.match_clock = 0.0
         self.status = "starting"
         self._last_video_frame_t = -1.0
+        self.overlays.clear()
+        self.overlay_latency_ms = None
         self._loop = asyncio.get_running_loop()
         self._stop_event = threading.Event()
         self._engine = ReplayEngine(
             self.state,
             speed=self.speed,
             on_tick=self.publish_from_worker,
+            on_fact=self.publish_facts_from_worker,
             stop_event=self._stop_event,
             config_provider=self.settings,
             on_record=self._on_replay_record,
@@ -134,6 +426,20 @@ class ReplayManager:
         self._fanout(self.compact_snapshot())
 
     def _on_replay_record(self, kind: str, record: dict[str, Any]) -> None:
+        wall_time = record.get("wall_time_utc")
+        if wall_time is None:
+            self._last_record_wall_time = datetime.now(timezone.utc)
+        elif isinstance(wall_time, str):
+            parsed_wall_time = datetime.fromisoformat(wall_time.replace("Z", "+00:00"))
+            if (
+                parsed_wall_time.tzinfo is None
+                or parsed_wall_time.utcoffset() != timedelta(0)
+            ):
+                raise ValueError("record wall_time_utc must include a UTC offset")
+            self._last_record_wall_time = parsed_wall_time.astimezone(timezone.utc)
+        else:
+            raise ValueError("record wall_time_utc must be an ISO-8601 string")
+        self.match_clock = max(0.0, float(self.state.minute) * 60.0)
         if kind != "frame" or record.get("source") != "video":
             return
         timestamp = float(record.get("t", 0.0))
@@ -179,6 +485,11 @@ class ReplayManager:
             self._fanout(self.compact_snapshot())
 
     async def stop(self) -> None:
+        if self.feed_processor is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="The live feed is managed by the service lifecycle",
+            )
         if self._stop_event:
             self._stop_event.set()
         if self._task and not self._task.done():
@@ -217,6 +528,7 @@ class ReplayManager:
             snapshot.update(
                 {
                     "status": self.status,
+                    "match_clock": self.match_clock,
                     "speed": self.speed,
                     "mode": self.mode,
                     "language": self.language,
@@ -226,6 +538,7 @@ class ReplayManager:
                     "frame": self.state.frames[-1] if self.state.frames else None,
                     "event_count": len(self.state.events),
                     "frame_count": len(self.state.frames),
+                    "overlay_latency_ms": self.overlay_latency_ms,
                 }
             )
             return snapshot
@@ -237,18 +550,68 @@ manager = ReplayManager()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     manager._loop = asyncio.get_running_loop()
-    yield
-    if manager._task and not manager._task.done():
-        await manager.stop()
+    feed_stop: asyncio.Event | None = None
+    feed_task: asyncio.Task[None] | None = None
+    processor: FeedProcessor | None = None
+    if os.getenv("EVENTHUB_NAMESPACE", "").strip():
+        processor = FeedProcessor(
+            create_feed_consumer(),
+            on_update=manager.on_feed_update,
+        )
+        manager.feed_processor = processor
+        manager.status = "live"
+        feed_stop = asyncio.Event()
+        feed_task = asyncio.create_task(processor.run(feed_stop))
+
+        def report_feed_error(task: asyncio.Task[None]) -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                manager.status = "error"
+                manager.error = f"{error.__class__.__name__}: {error}"
+                logger.error(
+                    "Live feed processor stopped unexpectedly (%s)",
+                    error.__class__.__name__,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        feed_task.add_done_callback(report_feed_error)
+    try:
+        yield
+    finally:
+        if manager._task and not manager._task.done():
+            await manager.stop()
+        if feed_stop is not None:
+            feed_stop.set()
+        if feed_task is not None:
+            try:
+                await feed_task
+            except Exception as error:
+                logger.error(
+                    "Live feed processor raised during shutdown (%s)",
+                    error.__class__.__name__,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+        if processor is not None:
+            await processor.close()
+        manager.feed_processor = None
+        for task in tuple(manager._narration_tasks):
+            task.cancel()
+        if manager._narration_tasks:
+            await asyncio.gather(*manager._narration_tasks, return_exceptions=True)
+        await manager.close_overlay_sink()
 
 
 app = FastAPI(title="Overseer", version="0.1.0", lifespan=lifespan)
 initialize_telemetry()
 _cors_origins = [
     origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
+if "*" in _cors_origins:
+    raise RuntimeError("CORS_ALLOWED_ORIGINS must not contain a wildcard")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -260,6 +623,15 @@ app.add_middleware(
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
+
+@app.get("/overlay", include_in_schema=False)
+@app.get("/overlay.html", include_in_schema=False)
+async def overlay_page() -> FileResponse:
+    return FileResponse(WEB_DIR / "overlay.html")
+
+@app.get("/overlay.js", include_in_schema=False)
+async def overlay_script() -> FileResponse:
+    return FileResponse(WEB_DIR / "overlay.js", media_type="text/javascript")
 
 
 @app.get("/app.js", include_in_schema=False)
@@ -286,6 +658,12 @@ async def styles() -> FileResponse:
 @app.get("/config.js", include_in_schema=False)
 async def frontend_config() -> FileResponse:
     return FileResponse(WEB_DIR / "config.js", media_type="text/javascript")
+
+@app.get("/overlays/recent", response_model=list[Overlay])
+async def get_recent_overlays(
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[Overlay]:
+    return manager.overlays.recent(limit)
 
 
 @app.get("/state")
@@ -342,7 +720,7 @@ async def fan_query(data: FanQueryRequest) -> dict[str, Any]:
 
 @app.get("/stream")
 async def stream(request: Request) -> StreamingResponse:
-    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=3)
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
     manager._subscribers.add(queue)
     await queue.put(json.dumps(manager.compact_snapshot(), ensure_ascii=False))
 
@@ -351,7 +729,10 @@ async def stream(request: Request) -> StreamingResponse:
             while not await request.is_disconnected():
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    yield f"data: {message}\n\n"
+                    if message.startswith("event: overlay"):
+                        yield message
+                    else:
+                        yield f"data: {message}\n\n"
                 except asyncio.TimeoutError:
                     yield ": keep-alive\n\n"
         finally:

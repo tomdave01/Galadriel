@@ -17,6 +17,7 @@
     impact: [],
     momentum: [],
     moments: [],
+    overlays: [],
     selectedEvent: null,
     selectedClip: null,
     spotlight: null,
@@ -206,7 +207,11 @@
     $("#minute").textContent = Number(data.minute || 0).toFixed(2);
     $("#match-status").textContent = String(data.status || "READY").toUpperCase();
     $("#source-label").textContent = `${String(data.source || "synthetic").toUpperCase()} DATA`;
-    $("#start-button").disabled = data.status === "running" || data.status === "starting";
+    const latency = data.overlay_latency_ms;
+    $("#latency-label").textContent = latency != null && Number.isFinite(Number(latency))
+      ? `LATENCY ${Math.round(Number(latency))} MS`
+      : "LATENCY —";
+    $("#start-button").disabled = ["running", "starting", "live"].includes(data.status);
     $("#stop-button").disabled = !["running", "starting"].includes(data.status);
   }
 
@@ -286,11 +291,26 @@
     </div>`).join("");
   }
 
-  function renderNarration(narration) {
-    if (!narration) return;
-    $("#narration-text").textContent = narration.text || "";
-    $("#narration-minute").textContent = `${Number(narration.minute || 0).toFixed(1)}'`;
-    $("#fallback-badge").classList.toggle("hidden", !narration.fallback);
+  function renderOverlay(overlay) {
+    if (!overlay || typeof overlay !== "object") return;
+    state.overlays = [
+      overlay,
+      ...state.overlays.filter((item) => item.overlay_id !== overlay.overlay_id)
+    ].slice(0, 100);
+    if (overlay.type === "narration") {
+      $("#narration-text").textContent = overlay.body || "";
+      $("#narration-minute").textContent = `${Number(overlay.match_clock / 60).toFixed(1)}'`;
+      $("#fallback-badge").classList.toggle(
+        "hidden",
+        overlay.headline !== "Template fallback"
+      );
+    }
+    const preview = $("#overlay-preview");
+    preview.innerHTML = `<span class="overlay-type">${escapeHtml(overlay.type || "overlay")}</span>
+      <strong>${escapeHtml(overlay.headline || "")}</strong>
+      <span>${escapeHtml(overlay.body || "")}</span>
+      <small>${escapeHtml(overlay.start_tc || "")} · ${escapeHtml(overlay.source_agent || "")}</small>`;
+    $("#overlay-json").textContent = JSON.stringify(overlay, null, 2);
   }
 
   function renderMoments(moments) {
@@ -315,7 +335,6 @@
     if (snapshot.momentum_series) state.momentum = snapshot.momentum_series;
     if (snapshot.moments) state.moments = snapshot.moments;
     if (snapshot.source === "video" && snapshot.frame) syncClipVideo(snapshot.frame);
-    if (snapshot.narration) renderNarration(snapshot.narration);
     renderShape(state.shape);
     renderPatterns(state.patterns);
     renderImpact(state.impact);
@@ -496,6 +515,13 @@
         console.error("Could not parse match stream update", error);
       }
     };
+    stream.addEventListener("overlay", (event) => {
+      try {
+        renderOverlay(JSON.parse(event.data));
+      } catch (error) {
+        console.error("Could not parse overlay stream update", error);
+      }
+    });
     stream.onerror = () => {
       $("#connection-label").textContent = "RECONNECTING";
     };
@@ -541,5 +567,10 @@
 
   connectStream();
   $("#fan-panel").hidden = $("#mode").value !== "Fan";
+  api("/overlays/recent?limit=100")
+    .then((overlays) => {
+      overlays.forEach(renderOverlay);
+    })
+    .catch((error) => showToast(error.message));
   api("/state").then(render).catch((error) => showToast(error.message));
 })();

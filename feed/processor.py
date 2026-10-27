@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from engine.schema import validate_event, validate_frame
 from engine.state import MatchState, ingest
@@ -21,6 +23,7 @@ from feed.persistence import (
 
 
 logger = logging.getLogger(__name__)
+UpdateCallback = Callable[[FeedMessage, MatchState], Awaitable[None] | None]
 
 
 @dataclass
@@ -42,6 +45,7 @@ class FeedProcessor:
         snapshot_interval_seconds: float | None = None,
         reorder_wait_seconds: float = 0.5,
         max_reorder_buffer: int = 8,
+        on_update: UpdateCallback | None = None,
     ) -> None:
         if snapshot_interval_seconds is None:
             snapshot_interval_seconds = float(
@@ -74,6 +78,7 @@ class FeedProcessor:
         self.snapshot_interval_seconds = snapshot_interval_seconds
         self.reorder_wait_seconds = reorder_wait_seconds
         self.max_reorder_buffer = max_reorder_buffer
+        self.on_update = on_update
         self.states: dict[str, MatchState] = {}
         self.duplicate_count = 0
         self._runtimes: dict[str, _MatchRuntime] = {}
@@ -178,6 +183,10 @@ class FeedProcessor:
             self._ingest_message(runtime.state, message)
             runtime.last_seq = message.seq
             runtime.next_seq = message.seq + 1
+            if self.on_update is not None:
+                update_result = self.on_update(message, runtime.state)
+                if inspect.isawaitable(update_result):
+                    await update_result
             if self._is_key_moment(message):
                 await self._save_snapshot_for(message.match_id, runtime)
 

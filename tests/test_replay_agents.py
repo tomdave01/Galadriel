@@ -272,6 +272,44 @@ def test_orchestrator_yields_facts_before_starting_narrator():
     assert agent.calls == 1
 
 
+def test_replay_engine_emits_facts_before_narration():
+    agent = _FakeAgent("Grounded generated narration.")
+    orchestrator = Orchestrator(narrator=Narrator(agent=agent))
+    callbacks: list[str] = []
+
+    def on_fact(_facts: dict) -> None:
+        assert isinstance(_facts, dict)
+        assert agent.calls == 0
+        callbacks.append("fact")
+
+    def on_tick(_tick: dict) -> None:
+        assert isinstance(_tick, dict)
+        assert agent.calls == 1
+        callbacks.append("narration")
+
+    replay = ReplayEngine(
+        orchestrator=orchestrator,
+        speed=1_000_000,
+        on_fact=on_fact,
+        on_tick=on_tick,
+    )
+    replay.run([
+        ReplayDataset(
+            name="single",
+            source="synthetic",
+            frames=[{
+                "t": 0.0,
+                "minute": 0.0,
+                "poss": "Rovers",
+                "ball": {"x": 50.0, "y": 50.0},
+                "players": [],
+            }],
+        )
+    ])
+
+    assert callbacks == ["fact", "narration"]
+
+
 def test_agent_framework_suite_builds_sequential_workflow():
     state = MatchState()
     client = FoundryChatClient(
