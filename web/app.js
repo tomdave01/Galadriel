@@ -290,7 +290,7 @@
     if (!narration) return;
     $("#narration-text").textContent = narration.text || "";
     $("#narration-minute").textContent = `${Number(narration.minute || 0).toFixed(1)}'`;
-    $("#mock-badge").classList.toggle("hidden", !narration.mock);
+    $("#fallback-badge").classList.toggle("hidden", !narration.fallback);
   }
 
   function renderMoments(moments) {

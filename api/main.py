@@ -337,7 +337,7 @@ async def fan_query(data: FanQueryRequest) -> dict[str, Any]:
     query = data.query.strip()
     if not query:
         raise HTTPException(status_code=422, detail="query must not be blank")
-    return manager.fan_curator.query(manager.state, query)
+    return await manager.fan_curator.query_async(manager.state, query)
 
 
 @app.get("/stream")

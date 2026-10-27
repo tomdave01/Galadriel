@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
+from agent_framework.foundry import FoundryChatClient
+from azure.identity import AzureCliCredential
+
 from agents import FanCurator, Orchestrator
+from agents.framework_agents import build_agent_suite
+from agents.narrator import Narrator
 from engine.replay import ReplayDataset, ReplayEngine
 from engine.state import MatchState, ingest
-from llm.client import LLMClient
+from feed.persistence import InMemoryNarrationCache
+from azure.identity import CredentialUnavailableError
 
 
 def _event(
@@ -30,6 +39,20 @@ def _event(
         "end_x": None,
         "end_y": None,
     }
+
+
+class _FakeAgent:
+    def __init__(self, text: str, *, delay: float = 0) -> None:
+        self.text = text
+        self.delay = delay
+        self.calls = 0
+
+    async def run(self, _prompt: str) -> SimpleNamespace:
+        self.calls += 1
+        assert _prompt
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return SimpleNamespace(text=self.text)
 
 
 def test_ingest_tracks_goals_minute_and_source():
@@ -80,13 +103,11 @@ def test_fan_curator_filters_shots_on_target():
 
 
 def test_fan_curator_parses_team_player_and_event_filters():
-    state = MatchState(
-        events=[
-            _event("Rovers", "Rico Vale", "on_target"),
-            _event("Rovers", "Rico Vale", "off_target"),
-            _event("United", "Ira West", "on_target"),
-        ]
-    )
+    state = MatchState(events=[
+        _event("Rovers", "Rico Vale", "on_target"),
+        _event("Rovers", "Rico Vale", "off_target"),
+        _event("United", "Ira West", "on_target"),
+    ])
     result = FanCurator().query(state, "Rovers Rico Vale shots on target")
     assert result["filters"] == {
         "team": "Rovers",
@@ -97,46 +118,122 @@ def test_fan_curator_parses_team_player_and_event_filters():
     assert result["count"] == 1
 
 
-def test_llm_client_sends_configured_bearer_key(monkeypatch, tmp_path):
-    import io
-    import json
+def test_fan_curator_rejects_unlisted_structured_filters():
+    state = MatchState(events=[_event("Rovers", "Rico Vale", "goal")])
+    curator = FanCurator(agent=_FakeAgent('{"team":"Invented FC","type":["shot"]}'))
 
-    import llm.client as llm_module
+    result = asyncio.run(curator.query_async(state, "show me tactical sequences"))
 
-    captured: dict[str, str | None] = {}
+    assert result["filters"] == {}
+    assert result["count"] == 0
+    assert result["compiled_by"] == "code"
+    assert result["fallback_reason"]
 
-    def fake_urlopen(request, timeout):
-        captured["authorization"] = request.get_header("Authorization")
-        captured["timeout"] = str(timeout)
-        return io.BytesIO(
-            json.dumps(
-                {"choices": [{"message": {"content": "A verified response."}}]}
-            ).encode()
-        )
 
-    monkeypatch.delenv("LLM_MOCK", raising=False)
-    monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
-    client = LLMClient(
-        base_url="https://llm.example/v1",
-        api_key="unit-test-key",
-        model="test-model",
-        cache_dir=tmp_path,
+def test_fan_curator_accepts_schema_validated_filters():
+    state = MatchState(events=[_event("Rovers", "Rico Vale", "goal")])
+    curator = FanCurator(
+        agent=_FakeAgent('{"team":"Rovers","type":["shot"],"outcome":["goal"]}')
     )
-    result = client.complete("a prompt", fallback_text="fallback")
-    assert captured["authorization"] == "Bearer unit-test-key"
-    assert result["text"] == "A verified response."
-    assert result["mock"] is False
+
+    result = asyncio.run(curator.query_async(state, "show me decisive moments"))
+
+    assert result["compiled_by"] == "agent_framework"
+    assert result["count"] == 1
+    assert result["filters"]["team"] == "Rovers"
 
 
-def test_llm_mock_and_orchestrator_narration_are_explicit(monkeypatch, tmp_path):
-    monkeypatch.setenv("LLM_MOCK", "1")
-    client = LLMClient(cache_dir=tmp_path)
-    client._write_cache(client._cache_key("facts", "", False), "Cached live response.")
-    result = client.complete("facts", fallback_text="Rovers lead.")
-    assert result["mock"] is True
-    assert result["text"] == "Rovers lead."
-    assert "enabled" in result["reason"]
+def test_narrator_uses_templated_fallback_after_two_timeouts():
+    state = MatchState()
+    agent = _FakeAgent("too late", delay=0.05)
 
+    result = asyncio.run(
+        Narrator(agent=agent, timeout_seconds=0.001).narrate(
+            state,
+            mode="Broadcast",
+            language="English",
+        )
+    )
+
+    assert agent.calls == 2
+    assert result["fallback"] is True
+    assert result["fact_id"]
+    assert result["text"]
+
+
+def test_narrator_content_safety_replaces_rejected_output(monkeypatch):
+    monkeypatch.setenv("AZURE_CONTENT_SAFETY_ENABLED", "1")
+    monkeypatch.setattr("agents.narrator.narrator_output_is_safe", lambda text: not text)
+
+    result = asyncio.run(
+        Narrator(agent=_FakeAgent("Rejected generated narration.")).narrate(
+            MatchState(),
+            language="English",
+        )
+    )
+
+    assert result["fallback"] is True
+    assert result["reason"] == "ContentSafetyRejected"
+    assert "Rejected generated narration" not in result["text"]
+
+
+def test_optional_translator_only_translates_template_fallback(monkeypatch):
+    monkeypatch.setenv("AZURE_TRANSLATOR_ENABLED", "1")
+    translated_input: list[str] = []
+
+    def fake_translate(text: str, language: str, names: list[str]) -> str:
+        translated_input.append(text)
+        assert language == "Spanish"
+        assert "Rico Vale" in names
+        assert "Rovers" in names and "United" in names
+        return f"{language}:{text}"
+
+    monkeypatch.setattr("agents.narrator.translate_narration", fake_translate)
+    state = MatchState(events=[_event("Rovers", "Rico Vale", "goal")])
+    narrator = Narrator(
+        agent=_FakeAgent("late response", delay=0.2),
+        timeout_seconds=0.05,
+    )
+
+    result = asyncio.run(narrator.narrate(state, language="Spanish"))
+
+    assert result["fallback"] is True
+    assert result["text"].startswith("Spanish:")
+    assert "Rovers" in translated_input[0]
+
+
+def test_narrator_cache_separates_mode_language_and_favourite():
+    state = MatchState()
+    agent = _FakeAgent("Grounded generated narration.")
+    cache = InMemoryNarrationCache()
+    narrator = Narrator(agent=agent, cache=cache)
+
+    async def run() -> list[dict]:
+        first = await narrator.narrate(state, favourite_team="Rovers")
+        repeated = await narrator.narrate(state, favourite_team="Rovers")
+        analyst = await narrator.narrate(
+            state,
+            mode="Analyst",
+            favourite_team="Rovers",
+        )
+        spanish = await narrator.narrate(
+            state,
+            language="Spanish",
+            favourite_team="Rovers",
+        )
+        rival = await narrator.narrate(state, favourite_team="United")
+        return [first, repeated, analyst, spanish, rival]
+
+    results = asyncio.run(run())
+    assert agent.calls == 4
+    assert results[0]["text"] == results[1]["text"]
+    assert results[0]["fact_id"] == results[1]["fact_id"]
+    assert len({result["mode"] for result in (results[0], results[2])}) == 2
+    assert results[3]["language"] == "Spanish"
+    assert results[4]["favourite_team"] == "United"
+
+
+def test_orchestrator_keeps_deterministic_analysis_and_template_fallback():
     state = MatchState()
     state.events = [_event("Rovers", "Rico Vale", "goal", minute=1)]
     state.frames = [
@@ -148,46 +245,73 @@ def test_llm_mock_and_orchestrator_narration_are_explicit(monkeypatch, tmp_path)
             "players": [],
         }
     ]
+
     output = Orchestrator().tick(state, mode="Broadcast", language="English")
-    assert output["narration"]["mock"] is True
+
+    assert output["narration"]["fallback"] is True
     assert "Rovers" in output["narration"]["text"]
     assert state.moments[0]["type"] == "goal"
 
 
-def test_optional_translator_runs_inside_workflow_and_preserves_state(
-    monkeypatch,
-):
-    import agents.workflow as workflow_module
-
-    monkeypatch.setenv("LLM_MOCK", "1")
-    monkeypatch.setenv("AZURE_TRANSLATOR_ENABLED", "1")
-
-    def fake_translate(text: str, language: str, names: list[str]) -> str:
-        assert names[-2:] == ["Rovers", "United"]
-        return f"{language}:{text}"
-
-    monkeypatch.setattr(
-        workflow_module,
-        "translate_narration",
-        fake_translate,
-    )
+def test_orchestrator_yields_facts_before_starting_narrator():
     state = MatchState()
-    result = Orchestrator().tick(state, language="Spanish")
-    assert result["narration"]["language"] == "Spanish"
-    assert result["narration"]["text"].startswith("Spanish:")
-    assert state.narration_log[-1]["text"] == result["narration"]["text"]
+    agent = _FakeAgent("Grounded generated narration.")
+    orchestrator = Orchestrator(narrator=Narrator(agent=agent))
+
+    async def collect_events() -> list[dict]:
+        events = orchestrator.iter_tick_events(state)
+        first = await anext(events)
+        assert first["type"] == "fact"
+        assert agent.calls == 0
+        second = await anext(events)
+        return [first, second]
+
+    events = asyncio.run(collect_events())
+
+    assert events[1]["type"] == "narration"
+    assert agent.calls == 1
+
+
+def test_agent_framework_suite_builds_sequential_workflow():
+    state = MatchState()
+    client = FoundryChatClient(
+        project_endpoint="https://example.services.ai.azure.com/api/projects/test",
+        model="model",
+        credential=AzureCliCredential(),
+    )
+    orchestrator = Orchestrator()
+
+    suite = build_agent_suite(
+        state=state,
+        shape_analyst=orchestrator.shape_tool,
+        pattern_spotter=orchestrator.pattern_tool,
+        impact_analyst=orchestrator.impact_tool,
+        moment_detector=orchestrator.moment_tool,
+        narrator=orchestrator.narrator,
+        fan_curator=orchestrator.fan_curator,
+        client=client,
+    )
+
+    assert suite.orchestrator.name == "Orchestrator"
+    assert suite.shape_analyst.name == "ShapeAnalyst"
+    assert suite.fan_curator.name == "FanCurator"
+    assert suite.workflow is not None
 
 
 def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
     from types import SimpleNamespace
 
     import azure.ai.translation.text as translation_sdk
+    import llm.translator as translator_module
     from llm.translator import translate_narration
 
     monkeypatch.setenv("AZURE_TEXT_TRANSLATION_ENDPOINT", "https://translator.test")
-    monkeypatch.setenv("AZURE_TEXT_TRANSLATION_APIKEY", "test-key")
     monkeypatch.setenv("AZURE_TEXT_TRANSLATION_REGION", "eastus")
     captured: tuple[list[str], list[str], str] | None = None
+
+    class FakeCredential:
+        def close(self) -> None:
+            pass
 
     class FakeTranslator:
         def __init__(self, **_: object) -> None:
@@ -210,6 +334,10 @@ def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
                 )
             ]
 
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(translator_module, "DefaultAzureCredential", FakeCredential)
     monkeypatch.setattr(translation_sdk, "TextTranslationClient", FakeTranslator)
     result = translate_narration(
         "Rico Vale scores for Rovers", "Spanish", ["Rico Vale", "Rovers"]
@@ -220,3 +348,37 @@ def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
         "en",
     )
     assert result == "Rico Vale anota para Rovers"
+
+
+def test_foundry_uses_api_key_only_after_credential_failure(monkeypatch):
+    import llm.client as client_module
+
+    captured: dict[str, object] = {}
+
+    class UnavailableCredential:
+        def get_token(self, scope: str) -> None:
+            assert scope
+            raise CredentialUnavailableError("no Entra credential")
+
+        def close(self) -> None:
+            captured["credential_closed"] = True
+
+    def fake_foundry_client(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setenv(
+        "FOUNDRY_PROJECT_ENDPOINT",
+        "https://example.services.ai.azure.com/api/projects/test",
+    )
+    monkeypatch.setenv("FOUNDRY_MODEL", "test-deployment")
+    monkeypatch.setenv("FOUNDRY_API_KEY", "unit-test-key")
+    monkeypatch.setattr(client_module, "DefaultAzureCredential", UnavailableCredential)
+    monkeypatch.setattr(client_module, "FoundryChatClient", fake_foundry_client)
+
+    client_module.create_foundry_chat_client()
+
+    assert captured["model"] == "test-deployment"
+    assert captured["default_headers"] == {"api-key": "unit-test-key"}
+    assert "credential" not in captured
+    assert captured["credential_closed"] is True

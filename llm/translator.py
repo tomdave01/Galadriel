@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 
+from azure.identity import DefaultAzureCredential
 
 _TARGET_LANGUAGES = {"Spanish": "es", "Arabic": "ar", "French": "fr"}
 
@@ -22,15 +23,13 @@ def translate_narration(text: str, language: str, names: list[str]) -> str:
         return text
 
     endpoint = os.getenv("AZURE_TEXT_TRANSLATION_ENDPOINT")
-    key = os.getenv("AZURE_TEXT_TRANSLATION_APIKEY")
     region = os.getenv("AZURE_TEXT_TRANSLATION_REGION")
-    if not endpoint or not key or not region:
+    if not endpoint or not region:
         raise RuntimeError(
-            "Azure Translator is enabled but endpoint, API key, or region is missing"
+            "Azure Translator is enabled but endpoint or region is missing"
         )
 
     from azure.ai.translation.text import TextTranslationClient
-    from azure.core.credentials import AzureKeyCredential
 
     placeholders: dict[str, str] = {}
     protected_text = text
@@ -40,17 +39,22 @@ def translate_narration(text: str, language: str, names: list[str]) -> str:
         protected_text = re.sub(re.escape(name), token, protected_text)
         placeholders[token] = name
 
+    credential = DefaultAzureCredential()
     client = TextTranslationClient(
         endpoint=endpoint,
-        credential=AzureKeyCredential(key),
+        credential=credential,
         region=region,
     )
-    response = client.translate(
-        body=[protected_text],
-        to_language=[target],
-        from_language="en",
-    )
-    translated = response[0].translations[0].text
-    for token, name in placeholders.items():
-        translated = translated.replace(token, name)
-    return translated
+    try:
+        response = client.translate(
+            body=[protected_text],
+            to_language=[target],
+            from_language="en",
+        )
+        translated = response[0].translations[0].text
+        for token, name in placeholders.items():
+            translated = translated.replace(token, name)
+        return translated
+    finally:
+        client.close()
+        credential.close()

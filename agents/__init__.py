@@ -1,16 +1,14 @@
-"""Plain-Python agents for Overseer."""
+"""Microsoft Agent Framework roles for Overseer."""
 
-from agents.analysts import ImpactAnalyst, MomentDetector, PatternSpotter, ShapeAnalyst
 from agents.fan_curator import FanCurator
+from agents.framework_agents import AgentSuite, build_agent_suite
 from agents.narrator import Narrator
 from agents.orchestrator import Orchestrator
 
 __all__ = [
+    "AgentSuite",
     "FanCurator",
-    "ImpactAnalyst",
-    "MomentDetector",
     "Narrator",
     "Orchestrator",
-    "PatternSpotter",
-    "ShapeAnalyst",
+    "build_agent_suite",
 ]

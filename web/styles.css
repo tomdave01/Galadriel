@@ -93,8 +93,8 @@ h2 { margin: 4px 0 0; font: 650 15px var(--display); letter-spacing: -.02em; }
 .preference-grid select { width: 100%; padding: 8px 7px; font-size: 10px; }
 .narration-panel { border-color: #405235; background: linear-gradient(140deg, #1a2417, #151b16 68%); padding-bottom: 13px; }
 .narration-panel .eyebrow { color: #a3bf7b; }
-.mock-badge { display: inline-block; margin-left: 5px; padding: 2px 4px; border-radius: 3px; background: #29341e; color: var(--green); font-size: 7px; }
-.mock-badge.hidden { display: none; }
+.fallback-badge { display: inline-block; margin-left: 5px; padding: 2px 4px; border-radius: 3px; background: #29341e; color: var(--green); font-size: 7px; }
+.fallback-badge.hidden { display: none; }
 .narration-minute { color: #93a18f; font: 9px var(--mono); }
 .narration-text { min-height: 45px; margin: 0; padding: 0 15px; color: #dce8d9; font: 500 12px/1.65 var(--display); }
 .insight-popups { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px 15px 0; }

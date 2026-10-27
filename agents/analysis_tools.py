@@ -1,4 +1,4 @@
-"""Structured, prose-free match analyst agents."""
+"""Deterministic analysis tools used by the Agent Framework roles."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ def _window_frames(state: MatchState) -> list[dict[str, Any]]:
     return [frame for frame in state.frames if float(frame.get("minute", 0.0)) >= lower_bound]
 
 
-class ShapeAnalyst:
-    """Writes team shapes, blocks, marking styles, and detected changes."""
+class ShapeAnalysisTool:
+    """Compute team shapes, blocks, marking styles, and detected changes."""
 
     def __init__(self) -> None:
         self._previous: dict[str, dict[str, str]] = {}
@@ -76,8 +76,8 @@ class ShapeAnalyst:
         return state.shape
 
 
-class PatternSpotter:
-    """Writes only patterns that pass their explicit significance thresholds."""
+class PatternAnalysisTool:
+    """Compute only patterns that pass their explicit significance thresholds."""
 
     def analyze(self, state: MatchState) -> dict[str, Any]:
         events = _window_events(state)
@@ -105,8 +105,8 @@ class PatternSpotter:
         return state.patterns
 
 
-class ImpactAnalyst:
-    """Writes influence rankings and the current rolling momentum series."""
+class ImpactAnalysisTool:
+    """Compute influence rankings and the current rolling momentum series."""
 
     def analyze(self, state: MatchState) -> dict[str, Any]:
         events = _window_events(state)
@@ -118,8 +118,8 @@ class ImpactAnalyst:
         }
 
 
-class MomentDetector:
-    """Adds deduplicated goals, momentum swings, and shape changes to state."""
+class MomentDetectionTool:
+    """Add deduplicated goals, momentum swings, and shape changes to state."""
 
     def analyze(self, state: MatchState) -> list[dict[str, Any]]:
         existing_ids = {moment["id"] for moment in state.moments}

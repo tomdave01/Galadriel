@@ -2,22 +2,56 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import logging
 from typing import Any
 
+from feed.persistence import InMemoryNarrationCache, NarrationCache
 from engine.state import MatchState
-from llm.client import LLMClient
+from llm.client import create_foundry_chat_client
+from llm.safety import content_safety_enabled, narrator_output_is_safe
+from llm.translator import translate_narration, translation_enabled
+from telemetry import traced_agent_call
 
 
 SUPPORTED_LANGUAGES = {"English", "Spanish", "Arabic", "French"}
 SUPPORTED_MODES = {"Broadcast", "Analyst", "Fan"}
+logger = logging.getLogger(__name__)
+_INSTRUCTIONS = (
+    "Write one short football narration in the requested language and mode. "
+    "Use only facts in the supplied JSON facts object; do not infer or invent "
+    "statistics, events, or identities. Never translate player or club names. "
+    "Broadcast is a punchy fact. Analyst is metric-heavy and explains the "
+    "measured evidence. Fan is short, emotional, and plain-language, from the "
+    "favourite team's side when specified. Return plain text only."
+)
 
 
 class Narrator:
-    def __init__(self, client: LLMClient | None = None) -> None:
-        self.client = client or LLMClient()
+    def __init__(
+        self,
+        agent: Any | None = None,
+        *,
+        cache: NarrationCache | None = None,
+        timeout_seconds: float = 4.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+        self.agent = agent
+        self.cache = cache or InMemoryNarrationCache()
+        self.timeout_seconds = timeout_seconds
 
-    def narrate(
+    def _get_agent(self) -> Any:
+        if self.agent is None:
+            return create_foundry_chat_client().as_agent(
+                name="Narrator",
+                instructions=_INSTRUCTIONS,
+            )
+        return self.agent
+
+    async def narrate(
         self,
         state: MatchState,
         *,
@@ -31,6 +65,19 @@ class Narrator:
         if language not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported narration language: {language}")
         facts = self._facts(state, favourite_team, favourite_player)
+        fact_id = hashlib.sha256(
+            json.dumps(
+                facts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        favourite = json.dumps(
+            [favourite_team, favourite_player],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         fallback = self._template(facts, mode, language)
         prompt = json.dumps(
             {
@@ -42,31 +89,130 @@ class Narrator:
             },
             ensure_ascii=False,
         )
-        result = self.client.complete(
-            prompt,
-            system=(
-                "Write one short football narration in the requested language and mode. "
-                "Use only facts in the JSON facts object; do not infer or invent stats, "
-                "events, or player identities. Never translate player or club names. "
-                "Broadcast is a punchy lower-third fact. Analyst is metric-heavy and "
-                "explains why. Fan is short, emotional, plain language, from the "
-                "favourite team's side when specified. Return plain text only."
-            ),
-            fallback_text=fallback,
-        )
+        with traced_agent_call("Narrator", state, fact_ids=(fact_id,)) as span:
+            cached = await self.cache.get(fact_id, mode, language, favourite)
+            if cached is not None:
+                span.set_attribute("overseer.cache.hit", True)
+                text = cached
+                fallback_used = False
+                reason = None
+            else:
+                span.set_attribute("overseer.cache.hit", False)
+                text, fallback_used, reason = await self._generate(
+                    prompt,
+                    fallback,
+                    fact_id=fact_id,
+                )
+                if (
+                    fallback_used
+                    and translation_enabled()
+                    and language != "English"
+                ):
+                    names = {
+                        str(event["player"])
+                        for event in state.events
+                        if event.get("player")
+                    }
+                    names.update(("Rovers", "United"))
+                    try:
+                        translated = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                translate_narration,
+                                self._template(facts, mode, "English"),
+                                language,
+                                sorted(names, key=len, reverse=True),
+                            ),
+                            timeout=self.timeout_seconds,
+                        )
+                        text = translated
+                    except Exception as error:
+                        logger.warning(
+                            "Translator call failed; retaining native template (%s)",
+                            error.__class__.__name__,
+                            exc_info=True,
+                        )
+                        reason = f"TranslatorError: {error.__class__.__name__}"
+                if content_safety_enabled():
+                    try:
+                        is_safe = await asyncio.to_thread(
+                            narrator_output_is_safe,
+                            text,
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            "Content Safety check failed; using template fallback (%s)",
+                            error.__class__.__name__,
+                            exc_info=True,
+                        )
+                        is_safe = False
+                        reason = f"ContentSafetyError: {error.__class__.__name__}"
+                    if not is_safe:
+                        text = fallback
+                        fallback_used = True
+                        reason = reason or "ContentSafetyRejected"
+                if not fallback_used:
+                    await self.cache.put(
+                        fact_id,
+                        mode,
+                        language,
+                        favourite,
+                        text,
+                    )
+            span.set_attribute("overseer.fact.output_ids", [fact_id])
+
         entry = {
             "minute": round(state.minute, 2),
             "mode": mode,
             "language": language,
             "favourite_team": favourite_team,
             "favourite_player": favourite_player,
-            "text": result["text"],
-            "mock": result["mock"],
-            "reason": result["reason"],
+            "fact_id": fact_id,
+            "text": text,
+            "fallback": fallback_used,
+            "reason": reason,
             "facts": facts,
         }
         state.narration_log.append(entry)
         return entry
+
+    async def _generate(
+        self,
+        prompt: str,
+        fallback: str,
+        *,
+        fact_id: str,
+    ) -> tuple[str, bool, str | None]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            agent: Any | None = None
+            owns_agent = self.agent is None
+            try:
+                agent = self._get_agent()
+                if agent is None:
+                    raise RuntimeError("Foundry Narrator agent was not created")
+                response = await asyncio.wait_for(
+                    agent.run(prompt),
+                    timeout=self.timeout_seconds,
+                )
+                text = response.text.strip()
+                if not text:
+                    raise ValueError("Foundry Narrator returned empty text")
+                return text, False, None
+            except Exception as error:
+                last_error = error
+                logger.warning(
+                    "Narrator call %d/2 failed for fact %s (%s)",
+                    attempt + 1,
+                    fact_id,
+                    error.__class__.__name__,
+                    exc_info=True,
+                )
+            finally:
+                if owns_agent and agent is not None:
+                    await agent.close()
+        if last_error is None:
+            raise RuntimeError("Narrator retry loop ended without a result")
+        return fallback, True, f"{last_error.__class__.__name__}: {last_error}"
 
     @staticmethod
     def _facts(
