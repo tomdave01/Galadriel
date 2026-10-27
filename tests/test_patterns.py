@@ -89,6 +89,15 @@ def test_generated_data_matches_shared_schema_and_normalized_coordinates(match_d
     )
 
 
+def test_frame_schema_accepts_replay_source_metadata(match_data):
+    _, frames = match_data
+    replay_frame = {**frames[0], "source": "synthetic"}
+    validate_frame(replay_frame)
+
+    with pytest.raises(ValueError, match="Frame source"):
+        validate_frame({**replay_frame, "source": "unknown"})
+
+
 def test_team_direction_normalizes_longitudinal_and_lateral_zones():
     rovers_frame = {
         "poss": "United",

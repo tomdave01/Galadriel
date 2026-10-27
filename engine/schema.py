@@ -13,6 +13,7 @@ EVENT_FIELDS = frozenset(
     }
 )
 FRAME_FIELDS = frozenset({"t", "minute", "poss", "ball", "players"})
+FRAME_OPTIONAL_FIELDS = frozenset({"source"})
 PLAYER_FIELDS = frozenset({"id", "team", "role", "x", "y"})
 
 EVENT_OUTCOMES = {
@@ -68,8 +69,11 @@ def validate_event(event: Any) -> None:
 
 
 def validate_frame(frame: Any) -> None:
-    if not isinstance(frame, dict) or set(frame) != FRAME_FIELDS:
+    allowed_fields = (FRAME_FIELDS, FRAME_FIELDS | FRAME_OPTIONAL_FIELDS)
+    if not isinstance(frame, dict) or set(frame) not in allowed_fields:
         raise ValueError("Frame must contain exactly the shared Frame schema fields")
+    if "source" in frame and frame["source"] not in {"synthetic", "video"}:
+        raise ValueError("Frame source must be synthetic or video")
     if _number(frame["minute"], "Frame minute") < 0:
         raise ValueError("Frame minute must not be negative")
     if _number(frame["t"], "Frame t") < 0:
