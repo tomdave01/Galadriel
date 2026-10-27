@@ -102,3 +102,71 @@ def test_llm_mock_and_orchestrator_narration_are_explicit(monkeypatch, tmp_path)
     assert output["narration"]["mock"] is True
     assert "Rovers" in output["narration"]["text"]
     assert state.moments[0]["type"] == "goal"
+
+
+def test_optional_translator_runs_inside_workflow_and_preserves_state(
+    monkeypatch,
+):
+    import agents.workflow as workflow_module
+
+    monkeypatch.setenv("LLM_MOCK", "1")
+    monkeypatch.setenv("AZURE_TRANSLATOR_ENABLED", "1")
+
+    def fake_translate(text: str, language: str, names: list[str]) -> str:
+        assert names[-2:] == ["Rovers", "United"]
+        return f"{language}:{text}"
+
+    monkeypatch.setattr(
+        workflow_module,
+        "translate_narration",
+        fake_translate,
+    )
+    state = MatchState()
+    result = Orchestrator().tick(state, language="Spanish")
+    assert result["narration"]["language"] == "Spanish"
+    assert result["narration"]["text"].startswith("Spanish:")
+    assert state.narration_log[-1]["text"] == result["narration"]["text"]
+
+
+def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
+    from types import SimpleNamespace
+
+    import azure.ai.translation.text as translation_sdk
+    from llm.translator import translate_narration
+
+    monkeypatch.setenv("AZURE_TEXT_TRANSLATION_ENDPOINT", "https://translator.test")
+    monkeypatch.setenv("AZURE_TEXT_TRANSLATION_APIKEY", "test-key")
+    monkeypatch.setenv("AZURE_TEXT_TRANSLATION_REGION", "eastus")
+    captured: tuple[list[str], list[str], str] | None = None
+
+    class FakeTranslator:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def translate(
+            self,
+            *,
+            body: list[str],
+            to_language: list[str],
+            from_language: str,
+        ) -> list[object]:
+            nonlocal captured
+            captured = (body, to_language, from_language)
+            text = body[0]
+            translated = text.replace("scores for", "anota para")
+            return [
+                SimpleNamespace(
+                    translations=[SimpleNamespace(text=translated)]
+                )
+            ]
+
+    monkeypatch.setattr(translation_sdk, "TextTranslationClient", FakeTranslator)
+    result = translate_narration(
+        "Rico Vale scores for Rovers", "Spanish", ["Rico Vale", "Rovers"]
+    )
+    assert captured == (
+        ["OVERSEERNAME0TOKEN scores for OVERSEERNAME1TOKEN"],
+        ["es"],
+        "en",
+    )
+    assert result == "Rico Vale anota para Rovers"

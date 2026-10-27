@@ -6,11 +6,14 @@ from typing import Any
 
 from agents.analysts import ImpactAnalyst, MomentDetector, PatternSpotter, ShapeAnalyst
 from agents.narrator import Narrator
+from agents.workflow import WorkflowRequest, run_match_analysis
 from engine.state import MatchState
+from telemetry import initialize_telemetry
 
 
 class Orchestrator:
     def __init__(self, narrator: Narrator | None = None) -> None:
+        initialize_telemetry()
         self.shape_analyst = ShapeAnalyst()
         self.pattern_spotter = PatternSpotter()
         self.impact_analyst = ImpactAnalyst()
@@ -26,23 +29,18 @@ class Orchestrator:
         favourite_team: str | None = None,
         favourite_player: str | None = None,
     ) -> dict[str, Any]:
-        """Run all specialists in dependency order, then narrate their facts."""
-        shape_result = self.shape_analyst.analyze(state)
-        patterns_result = self.pattern_spotter.analyze(state)
-        impact_result = self.impact_analyst.analyze(state)
-        moments_result = self.moment_detector.analyze(state)
-        narration = self.narrator.narrate(
-            state,
-            mode=mode,
-            language=language,
-            favourite_team=favourite_team,
-            favourite_player=favourite_player,
+        """Run the Microsoft Agent Framework workflow over shared match state."""
+        return run_match_analysis(
+            WorkflowRequest(
+                state=state,
+                shape_analyst=self.shape_analyst,
+                pattern_spotter=self.pattern_spotter,
+                impact_analyst=self.impact_analyst,
+                moment_detector=self.moment_detector,
+                narrator=self.narrator,
+                mode=mode,
+                language=language,
+                favourite_team=favourite_team,
+                favourite_player=favourite_player,
+            )
         )
-        return {
-            "minute": round(state.minute, 2),
-            "shape": shape_result,
-            "patterns": patterns_result,
-            **impact_result,
-            "moments": moments_result,
-            "narration": narration,
-        }

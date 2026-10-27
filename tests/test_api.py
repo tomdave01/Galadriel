@@ -13,6 +13,7 @@ def test_static_dashboard_and_state_route():
         assert "Match pitch" in page.text
         assert client.get("/app.js").status_code == 200
         assert client.get("/styles.css").status_code == 200
+        assert "OVERSEER_API_BASE_URL" in client.get("/config.js").text
         snapshot = client.get("/state")
         assert snapshot.status_code == 200
         assert snapshot.json()["status"] == "idle"

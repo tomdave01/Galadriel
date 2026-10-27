@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.fan_curator import FanCurator
 from engine.replay import ReplayDataset, ReplayEngine, default_datasets
 from engine.state import MatchState
+from telemetry import initialize_telemetry
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -241,6 +243,18 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Overseer", version="0.1.0", lifespan=lifespan)
+initialize_telemetry()
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/", include_in_schema=False)
@@ -267,6 +281,11 @@ async def clip_video() -> FileResponse:
 @app.get("/styles.css", include_in_schema=False)
 async def styles() -> FileResponse:
     return FileResponse(WEB_DIR / "styles.css", media_type="text/css")
+
+
+@app.get("/config.js", include_in_schema=False)
+async def frontend_config() -> FileResponse:
+    return FileResponse(WEB_DIR / "config.js", media_type="text/javascript")
 
 
 @app.get("/state")

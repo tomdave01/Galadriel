@@ -2,6 +2,8 @@
   "use strict";
 
   const $ = (selector) => document.querySelector(selector);
+  const API_BASE_URL = String(window.OVERSEER_API_BASE_URL || "").replace(/\/+$/, "");
+  const apiUrl = (path) => `${API_BASE_URL}${path}`;
   const pitch = $("#pitch");
   const pitchContext = pitch.getContext("2d");
   const chart = $("#momentum-chart");
@@ -32,7 +34,7 @@
   }
 
   async function api(path, options = {}) {
-    const response = await fetch(path, {
+    const response = await fetch(apiUrl(path), {
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
       ...options
     });
@@ -399,7 +401,7 @@
   function attachClipVideo() {
     const video = $("#video");
     if (state.videoSource || video.classList.contains("loaded")) return;
-    state.videoSource = "/clip-video";
+    state.videoSource = apiUrl("/clip-video");
     video.src = state.videoSource;
     video.muted = true;
     video.classList.add("loaded");
@@ -481,7 +483,7 @@
   }
 
   function connectStream() {
-    const stream = new EventSource("/stream");
+    const stream = new EventSource(apiUrl("/stream"));
     stream.onopen = () => {
       $("#connection-label").textContent = "CONNECTED";
       $("#connection-label").previousElementSibling.style.background = "#b6f35b";
