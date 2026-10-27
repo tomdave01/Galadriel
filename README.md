@@ -35,7 +35,14 @@ uses event `t` values when available.
 - `POST /fan-query` compiles a natural-language request into matching events.
 - `GET /frame?minute=...` returns the closest frame for moment replay.
 
-Run the test suite with `python -m pytest -q`.
+Install the clean-machine test dependencies and run all tests plus the
+ten-minute MOCK end-to-end smoke check:
+
+```powershell
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+python tests\smoke.py
+```
 
 ## Microsoft Agent Framework and Azure deployment
 
@@ -48,20 +55,22 @@ currently marked experimental by Microsoft.
 Dependency assumptions in `requirements.txt`:
 
 - `agent-framework-core==1.23.0` (Microsoft Agent Framework core/workflows
-  package; official project metadata version checked for this implementation).
+  package; this exact release is installed and exercised by the tests).
 - `microsoft-opentelemetry==1.5.0` (Microsoft OpenTelemetry distro; repository
-  metadata version checked for this implementation).
+  release installed and exercised by the tests).
 - `azure-ai-translation-text==2.0.0` (Azure AI Translator Python SDK; official
-  Azure SDK release version).
+  Azure SDK release installed for the optional Translator integration).
 - `fastapi` and `uvicorn` remain version-range dependencies as before.
 
-Microsoft Learn install examples for these packages are unpinned; the pins
-above are explicit compatibility assumptions and should be rechecked before
-upgrading. The functional workflow API is experimental. Azure Monitor
-export/tracing is initialized only when
-`APPLICATIONINSIGHTS_CONNECTION_STRING` is set. Each agent call emits an
-OpenTelemetry span with the agent name, match minute/source, event/frame
-counts, bounded output counts, duration, and failure status; raw frames,
+The current Agent Framework overview uses `pip install agent-framework`, while
+this project installs the lower-level `agent-framework-core` package directly
+to use its functional workflow API without a model-provider integration. The
+three versions above are the exact packages tested here, not Microsoft Learn
+compatibility recommendations; verify them again before upgrading. The
+functional workflow API is experimental. Azure Monitor export/tracing is
+initialized only when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set. Each
+agent call emits an OpenTelemetry span with the agent name, match minute/source,
+event/frame counts, bounded output counts, duration, and failure status; raw frames,
 narration prompts, and credentials are not added as span attributes.
 
 Azure AI Translator is opt-in (`AZURE_TRANSLATOR_ENABLED=1`) and requires

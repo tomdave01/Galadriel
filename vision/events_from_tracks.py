@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from engine.schema import validate_event, validate_frame
 from vision.annotated_video import write_annotated_video
 from vision.homography import load_config, perspective_matrix, transform_point
 from vision.team_split import load_roster_map, split_teams
@@ -113,10 +114,16 @@ def _player_and_ball_positions(
         center = detection.get("center")
         if not center or len(center) != 2:
             continue
-        position = transform_point(center, matrix)
         if detection.get("label") == "ball":
-            ball_position = position
+            ball_position = transform_point(center, matrix)
             continue
+        box = detection.get("bbox")
+        ground_point = (
+            ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
+            if isinstance(box, list) and len(box) == 4
+            else center
+        )
+        position = transform_point(ground_point, matrix)
         tracker_id, name, team = _identity(detection, roster)
         if tracker_id is None or name is None or team not in {"Rovers", "United"}:
             continue
@@ -139,13 +146,15 @@ def _interpolate_ball(
     times: list[float],
     max_gap: float,
 ) -> list[tuple[float, float]]:
+    if max_gap < 0:
+        raise ValueError("ball interpolation gap must not be negative")
     observed = [
         (index, item[1])
         for index, item in enumerate(positions)
         if item is not None
     ]
     if not observed:
-        return [(50.0, 50.0) for _ in positions]
+        raise ValueError("Tracking frames contain no ball detections")
     interpolated: list[tuple[float, float]] = []
     for index, item in enumerate(positions):
         if item is not None:
@@ -153,7 +162,11 @@ def _interpolate_ball(
             continue
         before = next(((i, point) for i, point in reversed(observed) if i < index), None)
         after = next(((i, point) for i, point in observed if i > index), None)
-        if before and after and times[after[0]] - times[before[0]] <= max_gap:
+        if (
+            before
+            and after
+            and times[after[0]] - times[before[0]] <= max_gap
+        ):
             fraction = (times[index] - times[before[0]]) / (
                 times[after[0]] - times[before[0]]
             )
@@ -161,10 +174,14 @@ def _interpolate_ball(
                 before[1][0] + (after[1][0] - before[1][0]) * fraction,
                 before[1][1] + (after[1][1] - before[1][1]) * fraction,
             )
-        elif before:
+        elif before and times[index] - times[before[0]] <= max_gap:
             point = before[1]
+        elif after and times[after[0]] - times[index] <= max_gap:
+            point = after[1]
         else:
-            point = after[1] if after else (50.0, 50.0)
+            raise ValueError(
+                f"No ball detection is within {max_gap:g} seconds of sampled frame {index}"
+            )
         interpolated.append(
             (round(min(100.0, max(0.0, point[0])), 3),
              round(min(100.0, max(0.0, point[1])), 3))
@@ -181,6 +198,12 @@ def _make_frames(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     source_frames = tracks["frames"]
     source_fps = float(tracks["fps"])
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be greater than zero")
+    if not source_frames:
+        raise ValueError("Tracking data must contain at least one frame")
+    if source_fps <= 0:
+        raise ValueError("Tracking FPS must be greater than zero")
     step = max(1, round(source_fps / sample_fps))
     selected = list(range(0, len(source_frames), step))
     if selected[-1] != len(source_frames) - 1 and len(source_frames) > 1:
@@ -357,6 +380,13 @@ def _make_events(
                     direction.get(team, "left_to_right") == "left_to_right"
                 ) else ball[0] <= float(config.get("goal_line_margin", 3.0))
                 on_target = abs(ball[1] - 50.0) <= 8.0
+                outcome = (
+                    "goal"
+                    if goal_line and on_target
+                    else "on_target"
+                    if on_target
+                    else "off_target"
+                )
                 events.append(
                     _event(
                         match_id=match_id,
@@ -365,7 +395,7 @@ def _make_events(
                         event_type="shot",
                         team=team,
                         player=current_holder["name"],
-                        outcome="on_target" if on_target or goal_line else "off_target",
+                        outcome=outcome,
                         start=previous_ball,
                         end=ball,
                     )
@@ -449,20 +479,20 @@ def _validate_corrected_events(
             raise ValueError(f"Corrected event {index} must set both end_x and end_y or neither")
         if end_x is not None and (not 0 <= end_x <= 100 or not 0 <= end_y <= 100):
             raise ValueError(f"Corrected event {index} has out-of-range end coordinates")
-        validated.append(
-            {
-                **event,
-                "match_id": match_id,
-                "clip_id": clip_id,
-                "source": "video",
-                "minute": round(event_minute, 4),
-                "t": round(timestamp, 4),
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "end_x": round(end_x, 2) if end_x is not None else None,
-                "end_y": round(end_y, 2) if end_y is not None else None,
-            }
-        )
+        normalized = {
+            **event,
+            "match_id": match_id,
+            "clip_id": clip_id,
+            "source": "video",
+            "minute": round(timestamp / 60.0, 4),
+            "t": round(timestamp, 4),
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "end_x": round(end_x, 2) if end_x is not None else None,
+            "end_y": round(end_y, 2) if end_y is not None else None,
+        }
+        validate_event(normalized)
+        validated.append(normalized)
     return sorted(validated, key=lambda event: event["t"])
 
 
@@ -523,6 +553,8 @@ def process_clip(
     frames, transformed = _make_frames(
         tracks, matrix, roster, config, sample_fps
     )
+    for frame in frames:
+        validate_frame(frame)
     events = _make_events(
         frames,
         transformed,
@@ -530,6 +562,8 @@ def process_clip(
         clip_id=clip_id,
         match_id=match_id,
     )
+    for event in events:
+        validate_event(event)
     event_path = destination / f"{clip_id}_events.json"
     frame_path = destination / f"{clip_id}_frames.json"
     if hand_correct is not None:

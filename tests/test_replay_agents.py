@@ -73,15 +73,65 @@ def test_fan_curator_filters_shots_on_target():
         _event("Rovers", "Leo Vale", "off_target"),
         _event("United", "Ira West", "on_target"),
     ])
-    result = FanCurator().query(state, "Rico Vale shots on target")
+    result = FanCurator().query(state, "Rovers Rico Vale shots on target")
     assert result["compiled_by"] == "code"
     assert result["count"] == 1
     assert result["clips"][0]["player"] == "Rico Vale"
 
 
+def test_fan_curator_parses_team_player_and_event_filters():
+    state = MatchState(
+        events=[
+            _event("Rovers", "Rico Vale", "on_target"),
+            _event("Rovers", "Rico Vale", "off_target"),
+            _event("United", "Ira West", "on_target"),
+        ]
+    )
+    result = FanCurator().query(state, "Rovers Rico Vale shots on target")
+    assert result["filters"] == {
+        "team": "Rovers",
+        "player": "Rico Vale",
+        "type": ["shot"],
+        "outcome": ["on_target", "goal"],
+    }
+    assert result["count"] == 1
+
+
+def test_llm_client_sends_configured_bearer_key(monkeypatch, tmp_path):
+    import io
+    import json
+
+    import llm.client as llm_module
+
+    captured: dict[str, str | None] = {}
+
+    def fake_urlopen(request, timeout):
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = str(timeout)
+        return io.BytesIO(
+            json.dumps(
+                {"choices": [{"message": {"content": "A verified response."}}]}
+            ).encode()
+        )
+
+    monkeypatch.delenv("LLM_MOCK", raising=False)
+    monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+    client = LLMClient(
+        base_url="https://llm.example/v1",
+        api_key="unit-test-key",
+        model="test-model",
+        cache_dir=tmp_path,
+    )
+    result = client.complete("a prompt", fallback_text="fallback")
+    assert captured["authorization"] == "Bearer unit-test-key"
+    assert result["text"] == "A verified response."
+    assert result["mock"] is False
+
+
 def test_llm_mock_and_orchestrator_narration_are_explicit(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_MOCK", "1")
     client = LLMClient(cache_dir=tmp_path)
+    client._write_cache(client._cache_key("facts", "", False), "Cached live response.")
     result = client.complete("facts", fallback_text="Rovers lead.")
     assert result["mock"] is True
     assert result["text"] == "Rovers lead."

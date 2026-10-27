@@ -78,6 +78,10 @@ def split_teams(
         [np.median(observations[identity], axis=0) for identity in identities],
         dtype=np.float64,
     )
+    if len(np.unique(colors, axis=0)) < 2:
+        raise ValueError(
+            "At least two distinct shirt colors are required to split teams"
+        )
     model = KMeans(n_clusters=2, random_state=42, n_init=10)
     labels = model.fit_predict(colors)
     centers = model.cluster_centers_

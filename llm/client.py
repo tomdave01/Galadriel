@@ -43,10 +43,6 @@ class LLMClient:
     ) -> dict[str, Any]:
         """Return generated text, or a visibly marked fallback when unavailable."""
         cache_key = self._cache_key(prompt, system, json_mode)
-        cached = self._read_cache(cache_key)
-        if cached is not None:
-            return {"text": cached, "mock": False, "cached": True, "reason": None}
-
         if os.getenv("LLM_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}:
             return {
                 "text": fallback_text,
@@ -54,6 +50,10 @@ class LLMClient:
                 "cached": False,
                 "reason": "LLM_MOCK is enabled",
             }
+
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return {"text": cached, "mock": False, "cached": True, "reason": None}
         if not (self.base_url and self.api_key and self.model):
             return {
                 "text": fallback_text,

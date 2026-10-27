@@ -375,7 +375,8 @@
     drawPitch();
     $("#spotlight-label").textContent = event.player ? `SPOTLIGHT · ${event.player.toUpperCase()}` : "NO PLAYER SPOTLIGHT";
     const timeParameter = event.t == null ? "" : `&t=${encodeURIComponent(event.t)}`;
-    api(`/frame?minute=${encodeURIComponent(event.minute || 0)}${timeParameter}`)
+    const sourceParameter = event.source ? `&source=${encodeURIComponent(event.source)}` : "";
+    api(`/frame?minute=${encodeURIComponent(event.minute || 0)}${timeParameter}${sourceParameter}`)
       .then((result) => {
         if (state.selectedEvent?.key !== `${event.minute}-${event.team}-${event.player}-${event.type}`) return;
         state.frame = result.frame;

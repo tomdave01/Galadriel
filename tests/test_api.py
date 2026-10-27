@@ -32,6 +32,38 @@ def test_clip_video_supports_byte_range_requests(tmp_path, monkeypatch):
     assert len(response.content) == 10
 
 
+def test_frame_lookup_uses_t_for_clip_and_minute_for_shifted_synthetic_frames():
+    original_state = manager.state
+    manager.state = MatchState(
+        frames=[
+            {
+                "t": 5.0,
+                "minute": 0.1,
+                "source": "video",
+                "poss": "Rovers",
+                "ball": {"x": 10, "y": 10},
+                "players": [],
+            },
+            {
+                "t": 5.0,
+                "minute": 30.1,
+                "source": "synthetic",
+                "poss": "United",
+                "ball": {"x": 90, "y": 90},
+                "players": [],
+            },
+        ]
+    )
+    try:
+        with TestClient(app) as client:
+            clip = client.get("/frame?minute=0.1&t=5&source=video")
+            synthetic = client.get("/frame?minute=30.1&source=synthetic")
+        assert clip.json()["frame"]["source"] == "video"
+        assert synthetic.json()["frame"]["source"] == "synthetic"
+    finally:
+        manager.state = original_state
+
+
 def test_control_preferences_and_fan_query():
     original_state = manager.state
     original_settings = (

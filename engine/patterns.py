@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from math import hypot
+from math import hypot, isfinite
 from typing import Any, Iterable
 
 
@@ -22,10 +22,20 @@ def _team_x(team: str, x: float) -> float:
     return float(x) if team == "Rovers" else 100.0 - float(x)
 
 
+def _team_y(team: str, y: float) -> float:
+    return float(y) if team == "Rovers" else 100.0 - float(y)
+
+
 def _event_time(event: dict[str, Any]) -> float:
     if event.get("t") is not None:
         return float(event["t"])
     return float(event.get("minute", 0.0)) * 60.0
+
+
+def _source_time(record: dict[str, Any], source: str) -> float:
+    if source == "video" and record.get("t") is not None:
+        return float(record["t"])
+    return float(record.get("minute", 0.0)) * 60.0
 
 
 def _frames_for(frames: Iterable[dict[str, Any]], team: str, in_poss: bool) -> list[dict[str, Any]]:
@@ -36,6 +46,8 @@ def _kmeans_1d(values: list[float], k: int = 3) -> list[float]:
     if not values:
         return []
     ordered = sorted(values)
+    if len(set(ordered)) < k:
+        return sorted(set(ordered))
     centers = [ordered[round((len(ordered) - 1) * index / (k - 1))] for index in range(k)]
     for _ in range(30):
         groups = [[] for _ in centers]
@@ -100,7 +112,7 @@ def shape(frames: Iterable[dict[str, Any]], team: str, in_poss: bool) -> dict[st
         "line_height": round(sum(frame_heights) / len(frame_heights), 2) if frame_heights else 0.0,
         "depth": round(sum(frame_depths) / len(frame_depths), 2) if frame_depths else 0.0,
         "width": round(sum(frame_widths) / len(frame_widths), 2) if frame_widths else 0.0,
-        "formation": "-".join(str(count) for count in counts),
+        "formation": "-".join(str(count) for count in counts) if len(centers) == 3 else "",
         "sample_frames": len(frame_heights),
     }
 
@@ -119,7 +131,7 @@ def flank_use(events: Iterable[dict[str, Any]], team: str) -> dict[str, Any]:
     for event in events:
         if event.get("team") != team or event.get("type") not in ("pass", "shot"):
             continue
-        y = float(event.get("y", 50.0))
+        y = _team_y(team, float(event.get("y", 50.0)))
         counts["left" if y < 33.0 else "right" if y > 66.0 else "centre"] += 1
     total = sum(counts.values())
     shares = {name: round(count / total, 4) if total else 0.0 for name, count in counts.items()}
@@ -165,7 +177,7 @@ def turnover_zones(events: Iterable[dict[str, Any]], team: str) -> dict[str, Any
         ):
             continue
         x = _team_x(team, float(event.get("x", 50.0)))
-        y = float(event.get("y", 50.0))
+        y = _team_y(team, float(event.get("y", 50.0)))
         third = "defensive" if x < 33.0 else "middle" if x < 66.0 else "attacking"
         flank = "left" if y < 33.0 else "right" if y > 66.0 else "centre"
         counts[f"{third}_{flank}"] += 1
@@ -181,23 +193,42 @@ def turnover_zones(events: Iterable[dict[str, Any]], team: str) -> dict[str, Any
     }
 
 
-def _nearest_frame(frames: list[dict[str, Any]], timestamp: float) -> dict[str, Any] | None:
-    if not frames:
+def _nearest_frame(
+    frames: list[dict[str, Any]], timestamp: float, source: str | None = None
+) -> dict[str, Any] | None:
+    candidates = (
+        [frame for frame in frames if frame.get("source") == source]
+        if source is not None and any(frame.get("source") is not None for frame in frames)
+        else frames
+    )
+    if not candidates:
         return None
-    return min(frames, key=lambda frame: abs(float(frame.get("t", frame.get("minute", 0.0) * 60.0)) - timestamp))
+    return min(
+        candidates,
+        key=lambda frame: abs(
+            _source_time(frame, source or str(frame.get("source", "synthetic")))
+            - timestamp
+        ),
+    )
 
 
 def _press_success(frame: dict[str, Any] | None, defending_team: str) -> bool:
     if frame is None:
         return False
-    ball = frame.get("ball", {})
+    ball = frame.get("ball")
+    if not isinstance(ball, dict) or ball.get("x") is None or ball.get("y") is None:
+        return False
+    ball_x = float(ball["x"])
+    ball_y = float(ball["y"])
+    if not isfinite(ball_x) or not isfinite(ball_y):
+        return False
     nearby = sum(
         1
         for player in frame.get("players", [])
         if player.get("team") == defending_team
         and player.get("role") != "GK"
-        and hypot(float(player.get("x", 0.0)) - float(ball.get("x", 50.0)),
-                  float(player.get("y", 0.0)) - float(ball.get("y", 50.0)))
+        and hypot(float(player.get("x", 0.0)) - ball_x,
+                  float(player.get("y", 0.0)) - ball_y)
         < PRESS_DISTANCE_THRESHOLD
     )
     return nearby >= 2
@@ -232,17 +263,21 @@ def press_triggers(
                 or event.get("outcome") != "lost"
             ):
                 continue
-            timestamp = _event_time(event)
-            target_frame = _nearest_frame(frame_list, timestamp + 2.0)
+            source = str(event.get("source", "synthetic"))
+            timestamp = _source_time(event, source)
+            target_frame = _nearest_frame(frame_list, timestamp + 2.0, source)
             trigger = _classify_lost_pass(event)
             samples[trigger].append(_press_success(target_frame, defending_team))
     else:
         for index in range(1, len(frame_list)):
             previous, current = frame_list[index - 1], frame_list[index]
+            if previous.get("source") != current.get("source"):
+                continue
             if previous.get("poss") == current.get("poss") or current.get("poss") != defending_team:
                 continue
-            timestamp = float(current.get("t", current.get("minute", 0.0) * 60.0))
-            prior_frame = _nearest_frame(frame_list, timestamp - 2.0)
+            source = str(current.get("source", "synthetic"))
+            timestamp = _source_time(current, source)
+            prior_frame = _nearest_frame(frame_list, timestamp - 2.0, source)
             ball = (prior_frame or previous).get("ball", {})
             later_ball = previous.get("ball", {})
             attacking_team = str(previous.get("poss", ""))
@@ -251,7 +286,7 @@ def press_triggers(
             )
             y = float(later_ball.get("y", 50.0))
             trigger = "back_pass" if dx < -2.0 else "touchline" if y < 15.0 or y > 85.0 else "other"
-            target_frame = _nearest_frame(frame_list, timestamp + 2.0)
+            target_frame = _nearest_frame(frame_list, timestamp + 2.0, source)
             samples[trigger].append(_press_success(target_frame, defending_team))
 
     results = {

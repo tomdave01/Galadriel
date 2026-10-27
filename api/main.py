@@ -297,17 +297,32 @@ async def get_state() -> dict[str, Any]:
 async def get_frame(
     minute: float = Query(ge=0),
     t: float | None = Query(default=None, ge=0),
+    source: Literal["video", "synthetic"] | None = None,
 ) -> dict[str, Any]:
     frames = manager.state.frames
     if not frames:
         raise HTTPException(status_code=404, detail="No replay frames are available yet")
-    target_time = t if t is not None else minute * 60.0
+    if source is not None:
+        frames = [frame for frame in frames if frame.get("source") == source]
+        if not frames:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No {source} replay frames are available",
+            )
+    if t is not None:
+        target_time = t
+
+        def frame_time(item: dict[str, Any]) -> float:
+            return float(item.get("t", float(item.get("minute", 0.0)) * 60.0))
+    else:
+        target_time = minute * 60.0
+
+        def frame_time(item: dict[str, Any]) -> float:
+            return float(item.get("minute", 0.0)) * 60.0
+
     frame = min(
         frames,
-        key=lambda item: abs(
-            float(item.get("t", float(item.get("minute", 0.0)) * 60.0))
-            - target_time
-        ),
+        key=lambda item: abs(frame_time(item) - target_time),
     )
     return {"frame": frame}
 
