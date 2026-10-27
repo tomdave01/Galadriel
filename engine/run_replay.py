@@ -73,6 +73,7 @@ def main() -> None:
     parser.add_argument("--frames", help="synthetic frames JSON path")
     parser.add_argument("--clip-events", help="optional clip-first events JSON")
     parser.add_argument("--clip-frames", help="optional clip-first frames JSON")
+    parser.add_argument("--clip-video", help="optional source clip MP4 synchronized to video events")
     parser.add_argument("--mode", choices=("Broadcast", "Analyst", "Fan"), default="Broadcast")
     parser.add_argument(
         "--language",
@@ -85,6 +86,8 @@ def main() -> None:
 
     if bool(arguments.clip_events) != bool(arguments.clip_frames):
         parser.error("--clip-events and --clip-frames must be provided together")
+    if arguments.clip_video and not arguments.clip_events:
+        parser.error("--clip-video requires --clip-events and --clip-frames")
 
     clip = None
     if arguments.clip_events:
@@ -93,6 +96,7 @@ def main() -> None:
             arguments.clip_frames,
             name="video-clip",
             source="video",
+            video_path=arguments.clip_video,
         )
     datasets = default_datasets(
         events_path=arguments.events,

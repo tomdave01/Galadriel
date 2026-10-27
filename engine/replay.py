@@ -18,6 +18,7 @@ class ReplayDataset:
     source: str
     events: list[dict[str, Any]] = field(default_factory=list)
     frames: list[dict[str, Any]] = field(default_factory=list)
+    video_path: str | Path | None = None
 
     @classmethod
     def from_files(
@@ -27,6 +28,7 @@ class ReplayDataset:
         *,
         name: str,
         source: str,
+        video_path: str | Path | None = None,
     ) -> "ReplayDataset":
         event_file = Path(events_path)
         frame_file = Path(frames_path)
@@ -37,7 +39,13 @@ class ReplayDataset:
             raise RuntimeError(f"Unable to load replay dataset {name}: {error}") from error
         if not isinstance(events, list) or not isinstance(frames, list):
             raise ValueError(f"Replay dataset {name} must contain JSON arrays")
-        return cls(name=name, source=source, events=events, frames=frames)
+        return cls(
+            name=name,
+            source=source,
+            events=events,
+            frames=frames,
+            video_path=video_path,
+        )
 
 
 TickCallback = Callable[[dict[str, Any]], None]
@@ -54,6 +62,7 @@ class ReplayEngine:
         on_tick: TickCallback | None = None,
         stop_event: threading.Event | None = None,
         config_provider: Callable[[], dict[str, Any]] | None = None,
+        on_record: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if speed <= 0:
             raise ValueError("speed must be greater than zero")
@@ -66,6 +75,7 @@ class ReplayEngine:
         self.on_tick = on_tick
         self.stop_event = stop_event or threading.Event()
         self.config_provider = config_provider
+        self.on_record = on_record
         self.tick_results: list[dict[str, Any]] = []
 
     def run(
@@ -99,6 +109,8 @@ class ReplayEngine:
                     ingest(self.state, event=value)
                 else:
                     ingest(self.state, frame=value)
+                if self.on_record:
+                    self.on_record(kind, value)
 
                 if self.state.minute >= next_tick_minute:
                     self._tick(
@@ -164,8 +176,6 @@ class ReplayEngine:
             normalized = dict(event)
             normalized["minute"] = absolute_time / 60.0
             normalized["source"] = str(event.get("source", dataset.source))
-            if event.get("t") is not None:
-                normalized["t"] = absolute_time
             records.append((absolute_time, 0, "event", normalized))
 
         for frame in dataset.frames:
@@ -178,8 +188,6 @@ class ReplayEngine:
             normalized = dict(frame)
             normalized["minute"] = absolute_time / 60.0
             normalized["source"] = str(frame.get("source", dataset.source))
-            if frame.get("t") is not None:
-                normalized["t"] = absolute_time
             records.append((absolute_time, 1, "frame", normalized))
 
         records.sort(key=lambda item: (item[0], item[1]))

@@ -19,6 +19,7 @@
     selectedClip: null,
     spotlight: null,
     objectUrl: null,
+    videoSource: null,
     toastTimer: null
   };
 
@@ -311,6 +312,7 @@
     if (snapshot.impact) state.impact = snapshot.impact;
     if (snapshot.momentum_series) state.momentum = snapshot.momentum_series;
     if (snapshot.moments) state.moments = snapshot.moments;
+    if (snapshot.source === "video" && snapshot.frame) syncClipVideo(snapshot.frame);
     if (snapshot.narration) renderNarration(snapshot.narration);
     renderShape(state.shape);
     renderPatterns(state.patterns);
@@ -384,8 +386,35 @@
 
   function seekVideo(event) {
     const video = $("#video");
-    if (!video.classList.contains("loaded") || event.t == null) return;
+    if (event.t == null) return;
+    if (event.source === "video" && !video.classList.contains("loaded")) {
+      attachClipVideo();
+    }
+    if (!video.classList.contains("loaded")) return;
     video.currentTime = Math.max(0, Number(event.t));
+    const playResult = video.play();
+    if (playResult && typeof playResult.catch === "function") playResult.catch(() => {});
+  }
+
+  function attachClipVideo() {
+    const video = $("#video");
+    if (state.videoSource || video.classList.contains("loaded")) return;
+    state.videoSource = "/clip-video";
+    video.src = state.videoSource;
+    video.muted = true;
+    video.classList.add("loaded");
+    $("#video-empty").hidden = true;
+  }
+
+  function syncClipVideo(frame) {
+    const video = $("#video");
+    if (video.dataset.localVideo === "true") return;
+    attachClipVideo();
+    if (!video.classList.contains("loaded") || frame.t == null) return;
+    const timestamp = Math.max(0, Number(frame.t));
+    if (Number.isFinite(timestamp) && Math.abs(video.currentTime - timestamp) > 0.35) {
+      video.currentTime = timestamp;
+    }
     const playResult = video.play();
     if (playResult && typeof playResult.catch === "function") playResult.catch(() => {});
   }
@@ -500,6 +529,7 @@
     if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
     state.objectUrl = URL.createObjectURL(file);
     video.src = state.objectUrl;
+    video.dataset.localVideo = "true";
     video.classList.add("loaded");
     $("#video-empty").hidden = true;
     showToast(`Loaded local clip: ${file.name}`);

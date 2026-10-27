@@ -61,6 +61,8 @@ def test_replay_processes_clip_before_synthetic_and_offsets_timeline():
     assert [event["source"] for event in state.events] == ["video", "synthetic"]
     assert state.events[1]["minute"] == state.events[0]["minute"]
     assert state.events[0]["t"] == 4.0
+    assert state.events[1]["t"] is None
+    assert state.frames[-1]["t"] == 0.0
     assert state.score == {"Rovers": 1, "United": 1}
     assert len(state.frames) == 2
 

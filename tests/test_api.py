@@ -21,6 +21,16 @@ def test_static_dashboard_and_state_route():
         assert missing_frame.status_code == 404
 
 
+def test_clip_video_supports_byte_range_requests(tmp_path, monkeypatch):
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(bytes(range(64)))
+    monkeypatch.setenv("CLIP_VIDEO_PATH", str(clip_path))
+    with TestClient(app) as client:
+        response = client.get("/clip-video", headers={"Range": "bytes=0-9"})
+    assert response.status_code == 206
+    assert len(response.content) == 10
+
+
 def test_control_preferences_and_fan_query():
     original_state = manager.state
     original_settings = (

@@ -53,6 +53,7 @@ class ReplayManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._subscribers: set[asyncio.Queue[str]] = set()
         self.fan_curator = FanCurator()
+        self._last_video_frame_t = -1.0
 
     def settings(self) -> dict[str, Any]:
         with self._lock:
@@ -115,6 +116,7 @@ class ReplayManager:
         self.state = MatchState()
         self.error = None
         self.status = "starting"
+        self._last_video_frame_t = -1.0
         self._loop = asyncio.get_running_loop()
         self._stop_event = threading.Event()
         self._engine = ReplayEngine(
@@ -123,16 +125,32 @@ class ReplayManager:
             on_tick=self.publish_from_worker,
             stop_event=self._stop_event,
             config_provider=self.settings,
+            on_record=self._on_replay_record,
         )
         self.status = "running"
         self._task = asyncio.create_task(self._run_worker())
         self._fanout(self.compact_snapshot())
+
+    def _on_replay_record(self, kind: str, record: dict[str, Any]) -> None:
+        if kind != "frame" or record.get("source") != "video":
+            return
+        timestamp = float(record.get("t", 0.0))
+        if timestamp - self._last_video_frame_t < 0.5:
+            return
+        self._last_video_frame_t = timestamp
+        self.publish_video_frame()
+
+    def publish_video_frame(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        self._loop.call_soon_threadsafe(self._fanout, self.compact_snapshot())
 
     async def _run_worker(self) -> None:
         try:
             clip = None
             clip_events = os.getenv("CLIP_EVENTS_PATH")
             clip_frames = os.getenv("CLIP_FRAMES_PATH")
+            clip_video = os.getenv("CLIP_VIDEO_PATH")
             if bool(clip_events) != bool(clip_frames):
                 raise RuntimeError("CLIP_EVENTS_PATH and CLIP_FRAMES_PATH must be set together")
             if clip_events and clip_frames:
@@ -142,6 +160,7 @@ class ReplayManager:
                     clip_frames,
                     name="video-clip",
                     source="video",
+                    video_path=clip_video,
                 )
             datasets = await asyncio.to_thread(default_datasets, clip=clip)
             engine = self._engine
@@ -232,6 +251,17 @@ async def index() -> FileResponse:
 @app.get("/app.js", include_in_schema=False)
 async def app_script() -> FileResponse:
     return FileResponse(WEB_DIR / "app.js", media_type="text/javascript")
+
+
+@app.get("/clip-video", include_in_schema=False)
+async def clip_video() -> FileResponse:
+    video_path = os.getenv("CLIP_VIDEO_PATH")
+    if not video_path:
+        raise HTTPException(status_code=404, detail="CLIP_VIDEO_PATH is not configured")
+    path = Path(video_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Configured clip video does not exist: {path}")
+    return FileResponse(path, media_type="video/mp4")
 
 
 @app.get("/styles.css", include_in_schema=False)
