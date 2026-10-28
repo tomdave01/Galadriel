@@ -1,10 +1,6 @@
 # Overseer
 
-Overseer is an Azure-native live football match-intelligence platform. Its
-primary data path is a broadcast-feed adapter or synthetic producer, Azure
-Event Hubs, an ordered processor, deterministic analysis, and machine-readable
-overlay output. Laptop execution is a development convenience, not the
-deployment model.
+Overseer is a multi-agent match-intelligence platform. Specialist agents analyse team shape, pressing, patterns of play, player influence and momentum from a live event feed, writing structured, traceable facts into a shared state. A grounded Narrator renders them as timecoded broadcast overlays and personalised, multilingual commentary for broadcast, analyst and fan modes, on Microsoft Foundry and Azure.
 
 ## Architecture in this refactor
 
