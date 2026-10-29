@@ -10,7 +10,7 @@ from typing import Any
 
 from feed.persistence import InMemoryNarrationCache, NarrationCache
 from engine.state import MatchState
-from llm.client import create_foundry_chat_client
+from llm.foundry import ask, make_agent
 from llm.safety import content_safety_enabled, narrator_output_is_safe
 from llm.translator import translate_narration, translation_enabled
 from telemetry import traced_agent_call
@@ -20,12 +20,12 @@ SUPPORTED_LANGUAGES = {"English", "Spanish", "Arabic", "French"}
 SUPPORTED_MODES = {"Broadcast", "Analyst", "Fan"}
 logger = logging.getLogger(__name__)
 _INSTRUCTIONS = (
-    "Write one short football narration in the requested language and mode. "
-    "Use only facts in the supplied JSON facts object; do not infer or invent "
-    "statistics, events, or identities. Never translate player or club names. "
-    "Broadcast is a punchy fact. Analyst is metric-heavy and explains the "
-    "measured evidence. Fan is short, emotional, and plain-language, from the "
-    "favourite team's side when specified. Return plain text only."
+    "Use ONLY facts in the supplied JSON; never invent numbers, players, or "
+    "events. Never translate player or club names. Write in the requested "
+    "language (English, Spanish, Arabic, or French) and mode: broadcast is "
+    "one punchy headline sentence; analyst is two sentences with the metric "
+    "and why it matters; fan is one short emotional sentence from the "
+    "favourite team's side. Return plain text only."
 )
 
 
@@ -35,7 +35,7 @@ class Narrator:
         agent: Any | None = None,
         *,
         cache: NarrationCache | None = None,
-        timeout_seconds: float = 4.0,
+        timeout_seconds: float = 6.0,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
@@ -45,10 +45,7 @@ class Narrator:
 
     def _get_agent(self) -> Any:
         if self.agent is None:
-            return create_foundry_chat_client().as_agent(
-                name="Narrator",
-                instructions=_INSTRUCTIONS,
-            )
+            self.agent = make_agent("Narrator", _INSTRUCTIONS)
         return self.agent
 
     async def narrate(
@@ -73,11 +70,7 @@ class Narrator:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        favourite = json.dumps(
-            [favourite_team, favourite_player],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        favourite = favourite_team
         fallback = self._template(facts, mode, language)
         prompt = json.dumps(
             {
@@ -183,33 +176,33 @@ class Narrator:
         fact_id: str,
     ) -> tuple[str, bool, str | None]:
         last_error: Exception | None = None
-        for attempt in range(2):
-            agent: Any | None = None
-            owns_agent = self.agent is None
+        for attempt in range(1):
             try:
                 agent = self._get_agent()
                 if agent is None:
                     raise RuntimeError("Foundry Narrator agent was not created")
-                response = await asyncio.wait_for(
-                    agent.run(prompt),
+                text = await ask(
+                    agent,
+                    prompt,
                     timeout=self.timeout_seconds,
+                    fallback=fallback,
                 )
-                text = response.text.strip()
+                text = text.strip()
+                if text == fallback:
+                    last_error = RuntimeError("Foundry Narrator used its fallback")
+                    continue
                 if not text:
                     raise ValueError("Foundry Narrator returned empty text")
                 return text, False, None
             except Exception as error:
                 last_error = error
+                print(f"[foundry] fell back: {error.__class__.__name__}")
                 logger.warning(
-                    "Narrator call %d/2 failed for fact %s (%s)",
+                    "Narrator call %d/1 failed for fact %s (%s)",
                     attempt + 1,
                     fact_id,
                     error.__class__.__name__,
-                    exc_info=True,
                 )
-            finally:
-                if owns_agent and agent is not None:
-                    await agent.close()
         if last_error is None:
             raise RuntimeError("Narrator retry loop ended without a result")
         return fallback, True, f"{last_error.__class__.__name__}: {last_error}"
@@ -258,7 +251,10 @@ class Narrator:
         patterns = facts["patterns"]
         best_player = facts["favourite_player_impact"]
         best = best_player or (facts["top_impact"][0] if facts["top_impact"] else None)
-        scoring_moment = next((moment for moment in reversed(moments) if moment["type"] == "goal"), None)
+        scoring_moment = next(
+            (moment for moment in reversed(moments) if moment.get("type") == "goal"),
+            None,
+        )
         notable_pattern = next(iter(patterns.values()), None)
 
         if language == "Spanish":

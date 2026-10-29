@@ -71,9 +71,9 @@ class ReplayManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._subscribers: set[asyncio.Queue[str]] = set()
         self.fan_curator = FanCurator()
-        self.orchestrator = Orchestrator()
+        self.orchestrator = Orchestrator(framework_agents_enabled=True)
         self.feed_processor: FeedProcessor | None = None
-        self._narration_tasks: set[asyncio.Task[None]] = set()
+        self._agent_tasks: set[asyncio.Task[Any]] = set()
         self._last_video_frame_t = -1.0
         self.overlays = OverlayHistory()
         self._last_record_wall_time = datetime.now(timezone.utc)
@@ -290,11 +290,28 @@ class ReplayManager:
             match_clock=message.match_clock,
         )
         settings = self.settings()
+        if facts.get("moments"):
+            analysis_task = asyncio.create_task(
+                self._run_live_agent_analysis(state, settings["mode"])
+            )
+            self._agent_tasks.add(analysis_task)
+            analysis_task.add_done_callback(self._finish_narration_task)
         task = asyncio.create_task(
             self._narrate_live_update(state, settings, message.match_clock)
         )
-        self._narration_tasks.add(task)
+        self._agent_tasks.add(task)
         task.add_done_callback(self._finish_narration_task)
+
+    async def _run_live_agent_analysis(
+        self,
+        state: MatchState,
+        mode: str,
+    ) -> None:
+        answers = await self.orchestrator.run_routed_agents(state, mode=mode)
+        if answers:
+            snapshot = self.compact_snapshot()
+            snapshot["agent_answers"] = answers
+            self._fanout(snapshot)
 
     async def _narrate_live_update(
         self,
@@ -316,14 +333,14 @@ class ReplayManager:
         )
         self._fanout(self.compact_snapshot())
 
-    def _finish_narration_task(self, task: asyncio.Task[None]) -> None:
-        self._narration_tasks.discard(task)
+    def _finish_narration_task(self, task: asyncio.Task[Any]) -> None:
+        self._agent_tasks.discard(task)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
             logger.error(
-                "Live Narrator task failed (%s)",
+                "Live background agent task failed (%s)",
                 error.__class__.__name__,
                 exc_info=(type(error), error, error.__traceback__),
             )
@@ -596,10 +613,10 @@ async def lifespan(_: FastAPI):
         if processor is not None:
             await processor.close()
         manager.feed_processor = None
-        for task in tuple(manager._narration_tasks):
+        for task in tuple(manager._agent_tasks):
             task.cancel()
-        if manager._narration_tasks:
-            await asyncio.gather(*manager._narration_tasks, return_exceptions=True)
+        if manager._agent_tasks:
+            await asyncio.gather(*manager._agent_tasks, return_exceptions=True)
         await manager.close_overlay_sink()
 
 

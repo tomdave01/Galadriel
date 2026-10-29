@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,13 +15,16 @@ from agents.analysis_tools import (
     PatternAnalysisTool,
     ShapeAnalysisTool,
 )
+from agents.framework_agents import AgentSuite, build_agent_suite
 from agents.fan_curator import FanCurator
 from agents.narrator import Narrator
-from agents.workflow import run_agent_workflow
 from engine.state import MatchState
 from feed.persistence import NarrationCache
-from llm.client import create_foundry_chat_client
+from llm.foundry import ask
 from telemetry import initialize_telemetry, traced_agent_call, traced_tool_call
+
+
+logger = logging.getLogger(__name__)
 
 
 def _fact_id(section: str, data: Any) -> str:
@@ -41,7 +45,7 @@ class Orchestrator:
         *,
         fan_curator: FanCurator | None = None,
         narration_cache: NarrationCache | None = None,
-        framework_client: Any | None = None,
+        framework_agents_enabled: bool = False,
     ) -> None:
         initialize_telemetry()
         self.shape_tool = ShapeAnalysisTool()
@@ -50,7 +54,84 @@ class Orchestrator:
         self.moment_tool = MomentDetectionTool()
         self.narrator = narrator or Narrator(cache=narration_cache)
         self.fan_curator = fan_curator or FanCurator()
-        self.framework_client = framework_client
+        self.framework_agents_enabled = framework_agents_enabled
+        self._agent_state: MatchState | None = None
+        self._agent_suite: AgentSuite | None = None
+
+    @staticmethod
+    def agents_for_mode(mode: str) -> tuple[str, ...]:
+        """Return the analyst roles relevant to each viewer mode."""
+        routes = {
+            "Broadcast": ("ShapeAnalyst", "PatternSpotter", "MomentDetector"),
+            "Analyst": (
+                "ShapeAnalyst",
+                "PatternSpotter",
+                "ImpactAnalyst",
+                "MomentDetector",
+            ),
+            "Fan": ("ImpactAnalyst", "MomentDetector"),
+        }
+        try:
+            return routes[mode]
+        except KeyError as error:
+            raise ValueError(f"Unsupported match mode: {mode}") from error
+
+    def _agents_for_state(self, state: MatchState) -> AgentSuite:
+        if self._agent_suite is None or self._agent_state is not state:
+            self._agent_suite = build_agent_suite(
+                state=state,
+                shape_analyst=self.shape_tool,
+                pattern_spotter=self.pattern_tool,
+                impact_analyst=self.impact_tool,
+                moment_detector=self.moment_tool,
+            )
+            self._agent_state = state
+        return self._agent_suite
+
+    async def run_routed_agents(
+        self,
+        state: MatchState,
+        *,
+        mode: str = "Broadcast",
+    ) -> dict[str, str]:
+        """Call only the mode-selected analyst agents, returning grounded replies."""
+        selected = self.agents_for_mode(mode)
+        if not self.framework_agents_enabled:
+            return {}
+
+        try:
+            suite = self._agents_for_state(state)
+        except Exception as error:
+            logger.warning(
+                "Agent Framework analysts unavailable (%s)",
+                error.__class__.__name__,
+            )
+            return {}
+
+        prompts = {
+            "ShapeAnalyst": "What block is United playing? Use team United.",
+            "PatternSpotter": "Summarize significant patterns for both teams.",
+            "ImpactAnalyst": "Summarize measured player impact and recent momentum.",
+            "MomentDetector": "List the detected moments from the current match.",
+        }
+        agents = {
+            "ShapeAnalyst": suite.shape_analyst,
+            "PatternSpotter": suite.pattern_spotter,
+            "ImpactAnalyst": suite.impact_analyst,
+            "MomentDetector": suite.moment_detector,
+        }
+        answers: dict[str, str] = {}
+        fact_ids = [
+            _fact_id("input", record)
+            for record in state.events[-50:] + state.frames[-50:]
+        ]
+        for agent_name in selected:
+            agent = agents[agent_name]
+            with traced_agent_call(agent_name, state, fact_ids=fact_ids):
+                answer = await ask(agent, prompts[agent_name], fallback="")
+            if answer:
+                answers[agent_name] = answer
+        return answers
 
     def analyze_facts(self, state: MatchState) -> dict[str, Any]:
         """Run the deterministic tools without waiting for any model call."""
@@ -95,6 +176,11 @@ class Orchestrator:
         facts = self.analyze_facts(state)
         yield {"type": "fact", "facts": facts}
 
+        agent_answers = (
+            await self.run_routed_agents(state, mode=mode)
+            if facts.get("moments")
+            else {}
+        )
         narration = await self.narrator.narrate(
             state,
             mode=mode,
@@ -102,7 +188,11 @@ class Orchestrator:
             favourite_team=favourite_team,
             favourite_player=favourite_player,
         )
-        yield {"type": "narration", "narration": narration}
+        yield {
+            "type": "narration",
+            "narration": narration,
+            "agent_answers": agent_answers,
+        }
 
     async def tick_async(
         self,
@@ -114,6 +204,11 @@ class Orchestrator:
         favourite_player: str | None = None,
     ) -> dict[str, Any]:
         facts = self.analyze_facts(state)
+        agent_answers = (
+            await self.run_routed_agents(state, mode=mode)
+            if facts.get("moments")
+            else {}
+        )
         narration = await self.narrator.narrate(
             state,
             mode=mode,
@@ -127,6 +222,7 @@ class Orchestrator:
             "momentum_series": state.momentum_series,
             "moments": state.moments,
             "narration": narration,
+            "agent_answers": agent_answers,
         }
 
     def tick(
@@ -152,24 +248,3 @@ class Orchestrator:
                 )
             )
         raise RuntimeError("Orchestrator.tick cannot run inside an event loop; await tick_async")
-
-    async def run_framework_workflow(
-        self,
-        state: MatchState,
-        prompt: str = "Analyze the current match using only the shared structured facts.",
-    ) -> Any:
-        """Run the Agent Framework sequential multi-agent workflow."""
-        from agents.framework_agents import build_agent_suite
-
-        client = self.framework_client or create_foundry_chat_client()
-        suite = build_agent_suite(
-            state=state,
-            shape_analyst=self.shape_tool,
-            pattern_spotter=self.pattern_tool,
-            impact_analyst=self.impact_tool,
-            moment_detector=self.moment_tool,
-            narrator=self.narrator,
-            fan_curator=self.fan_curator,
-            client=client,
-        )
-        return await run_agent_workflow(suite, state, prompt)

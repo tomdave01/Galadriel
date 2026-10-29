@@ -367,10 +367,6 @@ assign_azure_role "$SIMULATOR_PRINCIPAL_ID" "Azure Event Hubs Data Sender" "$EVE
 
 secret_args=("appinsights-connection=${APP_INSIGHTS_CONNECTION_STRING}")
 secret_env_args=("APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:appinsights-connection")
-if [[ -n "${FOUNDRY_API_KEY:-}" ]]; then
-  secret_args+=("foundry-api-key=${FOUNDRY_API_KEY}")
-  secret_env_args+=("FOUNDRY_API_KEY=secretref:foundry-api-key")
-fi
 if [[ -n "${WEB_PUBSUB_CONNECTION:-}" ]]; then
   secret_args+=("web-pubsub-connection=${WEB_PUBSUB_CONNECTION}")
   secret_env_args+=("WEB_PUBSUB_CONNECTION=secretref:web-pubsub-connection")

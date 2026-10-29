@@ -157,6 +157,16 @@ class ReplayEngine:
         if self.on_fact:
             facts = self.orchestrator.analyze_facts(self.state)
             self.on_fact(facts)
+            agent_answers = (
+                asyncio.run(
+                    self.orchestrator.run_routed_agents(
+                        self.state,
+                        mode=mode,
+                    )
+                )
+                if facts.get("moments")
+                else {}
+            )
             narration = asyncio.run(
                 self.orchestrator.narrator.narrate(
                     self.state,
@@ -172,6 +182,7 @@ class ReplayEngine:
                 "momentum_series": self.state.momentum_series,
                 "moments": self.state.moments,
                 "narration": narration,
+                "agent_answers": agent_answers,
             }
         else:
             result = self.orchestrator.tick(

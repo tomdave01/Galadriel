@@ -53,12 +53,21 @@ def narration_cache_key(
 
 class InMemoryNarrationCache:
     def __init__(self) -> None:
-        self._entries: dict[str, str] = {}
+        self._entries: dict[tuple[str, str, str, str | None], str] = {}
+
+    @staticmethod
+    def _key(
+        fact_id: str,
+        mode: str,
+        language: str,
+        favourite: str | None,
+    ) -> tuple[str, str, str, str | None]:
+        return fact_id, mode, language, favourite
 
     async def get(
         self, fact_id: str, mode: str, language: str, favourite: str | None
     ) -> str | None:
-        return self._entries.get(narration_cache_key(fact_id, mode, language, favourite))
+        return self._entries.get(self._key(fact_id, mode, language, favourite))
 
     async def put(
         self,
@@ -68,7 +77,7 @@ class InMemoryNarrationCache:
         favourite: str | None,
         narration: str,
     ) -> None:
-        self._entries[narration_cache_key(fact_id, mode, language, favourite)] = narration
+        self._entries[self._key(fact_id, mode, language, favourite)] = narration
 
 
 class CosmosNarrationCache(InMemoryNarrationCache):
@@ -80,7 +89,7 @@ class CosmosNarrationCache(InMemoryNarrationCache):
         self, fact_id: str, mode: str, language: str, favourite: str | None
     ) -> str | None:
         key = narration_cache_key(fact_id, mode, language, favourite)
-        cached = self._entries.get(key)
+        cached = self._entries.get(self._key(fact_id, mode, language, favourite))
         if cached is not None:
             return cached
         try:
@@ -90,7 +99,7 @@ class CosmosNarrationCache(InMemoryNarrationCache):
         narration = item.get("narration")
         if not isinstance(narration, str):
             raise ValueError(f"Cosmos narration cache item {key} has no narration text")
-        self._entries[key] = narration
+        self._entries[self._key(fact_id, mode, language, favourite)] = narration
         return narration
 
     async def put(
@@ -113,7 +122,7 @@ class CosmosNarrationCache(InMemoryNarrationCache):
                 "narration": narration,
             }
         )
-        self._entries[key] = narration
+        self._entries[self._key(fact_id, mode, language, favourite)] = narration
 
 
 class CosmosPersistence:

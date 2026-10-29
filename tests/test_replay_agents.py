@@ -3,16 +3,13 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from agent_framework.foundry import FoundryChatClient
-from azure.identity import AzureCliCredential
-
 from agents import FanCurator, Orchestrator
-from agents.framework_agents import build_agent_suite
+from agents.framework_agents import build_agent_suite, build_analysis_tools
 from agents.narrator import Narrator
 from engine.replay import ReplayDataset, ReplayEngine
 from engine.state import MatchState, ingest
 from feed.persistence import InMemoryNarrationCache
-from azure.identity import CredentialUnavailableError
+import pytest
 
 
 def _event(
@@ -143,7 +140,7 @@ def test_fan_curator_accepts_schema_validated_filters():
     assert result["filters"]["team"] == "Rovers"
 
 
-def test_narrator_uses_templated_fallback_after_two_timeouts():
+def test_narrator_uses_templated_fallback_after_timeout():
     state = MatchState()
     agent = _FakeAgent("too late", delay=0.05)
 
@@ -155,7 +152,7 @@ def test_narrator_uses_templated_fallback_after_two_timeouts():
         )
     )
 
-    assert agent.calls == 2
+    assert agent.calls == 1
     assert result["fallback"] is True
     assert result["fact_id"]
     assert result["text"]
@@ -310,30 +307,110 @@ def test_replay_engine_emits_facts_before_narration():
     assert callbacks == ["fact", "narration"]
 
 
-def test_agent_framework_suite_builds_sequential_workflow():
-    state = MatchState()
-    client = FoundryChatClient(
-        project_endpoint="https://example.services.ai.azure.com/api/projects/test",
-        model="model",
-        credential=AzureCliCredential(),
-    )
-    orchestrator = Orchestrator()
+def test_agent_framework_suite_uses_tool_backed_agents(monkeypatch):
+    import agents.framework_agents as framework_agents
 
-    suite = build_agent_suite(
-        state=state,
-        shape_analyst=orchestrator.shape_tool,
-        pattern_spotter=orchestrator.pattern_tool,
-        impact_analyst=orchestrator.impact_tool,
-        moment_detector=orchestrator.moment_tool,
-        narrator=orchestrator.narrator,
-        fan_curator=orchestrator.fan_curator,
-        client=client,
+    made_agents: dict[str, object] = {}
+
+    def fake_make_agent(name: str, instructions: str, tools: list) -> object:
+        agent = SimpleNamespace(name=name, instructions=instructions, tools=tools)
+        made_agents[name] = agent
+        return agent
+
+    monkeypatch.setattr(framework_agents, "make_agent", fake_make_agent)
+    suite = build_agent_suite(state=MatchState())
+
+    assert set(made_agents) == {
+        "ShapeAnalyst",
+        "PatternSpotter",
+        "ImpactAnalyst",
+        "MomentDetector",
+    }
+    assert suite.shape_analyst.tools[0].name == "get_team_shape"
+    assert suite.pattern_spotter.tools[0].name == "get_team_patterns"
+    assert suite.impact_analyst.tools[0].name == "get_player_impact"
+    assert suite.moment_detector.tools[0].name == "detect_recent_moments"
+    for agent in made_agents.values():
+        assert "Always call your available tool" in agent.instructions
+        assert "Never invent numbers" in agent.instructions
+
+
+def test_analysis_tools_close_over_state_and_write_owned_sections():
+    state = MatchState(
+        minute=1.0,
+        frames=[
+            {
+                "minute": 1.0,
+                "poss": "United",
+                "ball": {"x": 50.0, "y": 50.0},
+                "players": [],
+            }
+        ],
+    )
+    tools = build_analysis_tools(state=state)
+
+    shape_result = tools.shape.func(team="United")
+    pattern_result = tools.patterns.func(team="United")
+    impact_result = tools.impact.func()
+    moment_result = tools.moments.func(since_minute=0.0)
+
+    assert '"team": "United"' in shape_result
+    assert state.shape["teams"]["United"]
+    assert '"team": "United"' in pattern_result
+    assert state.patterns["findings"] == {}
+    assert '"impact":' in impact_result
+    assert state.impact is not None
+    assert '"moments":' in moment_result
+
+
+def test_orchestrator_routes_agents_by_mode():
+    assert Orchestrator.agents_for_mode("Broadcast") == (
+        "ShapeAnalyst",
+        "PatternSpotter",
+        "MomentDetector",
+    )
+    assert Orchestrator.agents_for_mode("Analyst") == (
+        "ShapeAnalyst",
+        "PatternSpotter",
+        "ImpactAnalyst",
+        "MomentDetector",
+    )
+    assert Orchestrator.agents_for_mode("Fan") == (
+        "ImpactAnalyst",
+        "MomentDetector",
+    )
+    with pytest.raises(ValueError, match="Unsupported match mode"):
+        Orchestrator.agents_for_mode("Unknown")
+
+
+def test_orchestrator_calls_only_the_selected_agents(monkeypatch):
+    class RoutedAgent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.prompts: list[str] = []
+
+        async def run(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return f"{self.name} grounded answer"
+
+    suite = SimpleNamespace(
+        shape_analyst=RoutedAgent("ShapeAnalyst"),
+        pattern_spotter=RoutedAgent("PatternSpotter"),
+        impact_analyst=RoutedAgent("ImpactAnalyst"),
+        moment_detector=RoutedAgent("MomentDetector"),
+    )
+    orchestrator = Orchestrator(framework_agents_enabled=True)
+    monkeypatch.setattr(orchestrator, "_agents_for_state", lambda _state: suite)
+
+    answers = asyncio.run(
+        orchestrator.run_routed_agents(MatchState(), mode="Broadcast")
     )
 
-    assert suite.orchestrator.name == "Orchestrator"
-    assert suite.shape_analyst.name == "ShapeAnalyst"
-    assert suite.fan_curator.name == "FanCurator"
-    assert suite.workflow is not None
+    assert set(answers) == {"ShapeAnalyst", "PatternSpotter", "MomentDetector"}
+    assert suite.shape_analyst.prompts
+    assert suite.pattern_spotter.prompts
+    assert suite.moment_detector.prompts
+    assert suite.impact_analyst.prompts == []
 
 
 def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
@@ -388,35 +465,47 @@ def test_translator_uses_sdk_text_list_and_restores_names(monkeypatch):
     assert result == "Rico Vale anota para Rovers"
 
 
-def test_foundry_uses_api_key_only_after_credential_failure(monkeypatch):
-    import llm.client as client_module
+def test_foundry_client_is_lazy_singleton_with_default_credential(monkeypatch):
+    import llm.foundry as foundry_module
 
     captured: dict[str, object] = {}
+    fake_credential = object()
 
-    class UnavailableCredential:
-        def get_token(self, scope: str) -> None:
-            assert scope
-            raise CredentialUnavailableError("no Entra credential")
-
-        def close(self) -> None:
-            captured["credential_closed"] = True
-
-    def fake_foundry_client(**kwargs: object) -> dict[str, object]:
+    def fake_foundry_client(**kwargs: object) -> object:
         captured.update(kwargs)
-        return kwargs
+        return object()
 
     monkeypatch.setenv(
         "FOUNDRY_PROJECT_ENDPOINT",
         "https://example.services.ai.azure.com/api/projects/test",
     )
     monkeypatch.setenv("FOUNDRY_MODEL", "test-deployment")
-    monkeypatch.setenv("FOUNDRY_API_KEY", "unit-test-key")
-    monkeypatch.setattr(client_module, "DefaultAzureCredential", UnavailableCredential)
-    monkeypatch.setattr(client_module, "FoundryChatClient", fake_foundry_client)
+    monkeypatch.setattr(foundry_module, "_client", None)
+    monkeypatch.setattr(
+        foundry_module,
+        "DefaultAzureCredential",
+        lambda: fake_credential,
+    )
+    monkeypatch.setattr(foundry_module, "FoundryChatClient", fake_foundry_client)
 
-    client_module.create_foundry_chat_client()
+    first_client = foundry_module.get_client()
+    second_client = foundry_module.get_client()
 
+    assert first_client is second_client
+    assert captured["project_endpoint"] == (
+        "https://example.services.ai.azure.com/api/projects/test"
+    )
     assert captured["model"] == "test-deployment"
-    assert captured["default_headers"] == {"api-key": "unit-test-key"}
-    assert "credential" not in captured
-    assert captured["credential_closed"] is True
+    assert captured["credential"] is fake_credential
+    assert "default_headers" not in captured
+
+
+def test_foundry_rejects_non_https_endpoint(monkeypatch):
+    import llm.foundry as foundry_module
+
+    monkeypatch.setattr(foundry_module, "_client", None)
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "http://foundry.example")
+    monkeypatch.setenv("FOUNDRY_MODEL", "test-deployment")
+
+    with pytest.raises(ValueError, match="must start with 'https://'"):
+        foundry_module.get_client()
