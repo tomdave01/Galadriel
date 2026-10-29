@@ -57,6 +57,7 @@ class Overlay(BaseModel):
     start_tc: str = Field(pattern=r"^\d{2,}:\d{2}:\d{2}\.\d{3}$")
     duration_ms: int = Field(ge=250, le=120_000, strict=True)
     priority: int = Field(ge=0, le=100, strict=True)
+    latency_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     mode: Literal["Broadcast", "Analyst", "Fan"]
     language: Literal["English", "Spanish", "Arabic", "French"]
     headline: str = Field(min_length=1, max_length=160)

@@ -186,6 +186,8 @@ class Narrator:
                     prompt,
                     timeout=self.timeout_seconds,
                     fallback=fallback,
+                    agent_name="Narrator",
+                    fact_ids=(fact_id,),
                 )
                 text = text.strip()
                 if text == fallback:

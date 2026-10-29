@@ -21,7 +21,7 @@ from agents.narrator import Narrator
 from engine.state import MatchState
 from feed.persistence import NarrationCache
 from llm.foundry import ask
-from telemetry import initialize_telemetry, traced_agent_call, traced_tool_call
+from telemetry import traced_agent_call, traced_tool_call
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ class Orchestrator:
         narration_cache: NarrationCache | None = None,
         framework_agents_enabled: bool = False,
     ) -> None:
-        initialize_telemetry()
         self.shape_tool = ShapeAnalysisTool()
         self.pattern_tool = PatternAnalysisTool()
         self.impact_tool = ImpactAnalysisTool()
@@ -127,8 +126,13 @@ class Orchestrator:
         ]
         for agent_name in selected:
             agent = agents[agent_name]
-            with traced_agent_call(agent_name, state, fact_ids=fact_ids):
-                answer = await ask(agent, prompts[agent_name], fallback="")
+            answer = await ask(
+                agent,
+                prompts[agent_name],
+                fallback="",
+                agent_name=agent_name,
+                fact_ids=fact_ids,
+            )
             if answer:
                 answers[agent_name] = answer
         return answers
@@ -176,11 +180,9 @@ class Orchestrator:
         facts = self.analyze_facts(state)
         yield {"type": "fact", "facts": facts}
 
-        agent_answers = (
-            await self.run_routed_agents(state, mode=mode)
-            if facts.get("moments")
-            else {}
-        )
+        if not facts.get("moments"):
+            return
+        agent_answers = await self.run_routed_agents(state, mode=mode)
         narration = await self.narrator.narrate(
             state,
             mode=mode,
@@ -204,18 +206,17 @@ class Orchestrator:
         favourite_player: str | None = None,
     ) -> dict[str, Any]:
         facts = self.analyze_facts(state)
-        agent_answers = (
-            await self.run_routed_agents(state, mode=mode)
-            if facts.get("moments")
-            else {}
-        )
-        narration = await self.narrator.narrate(
-            state,
-            mode=mode,
-            language=language,
-            favourite_team=favourite_team,
-            favourite_player=favourite_player,
-        )
+        agent_answers: dict[str, str] = {}
+        narration = None
+        if facts.get("moments"):
+            agent_answers = await self.run_routed_agents(state, mode=mode)
+            narration = await self.narrator.narrate(
+                state,
+                mode=mode,
+                language=language,
+                favourite_team=favourite_team,
+                favourite_player=favourite_player,
+            )
         return {
             **facts,
             "impact": state.impact,

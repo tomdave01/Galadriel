@@ -293,6 +293,10 @@
 
   function renderOverlay(overlay) {
     if (!overlay || typeof overlay !== "object") return;
+    const overlayLatency = Number(overlay.latency_ms);
+    if (Number.isFinite(overlayLatency)) {
+      $("#latency-label").textContent = `LATENCY ${Math.round(overlayLatency)} MS`;
+    }
     state.overlays = [
       overlay,
       ...state.overlays.filter((item) => item.overlay_id !== overlay.overlay_id)
@@ -309,7 +313,7 @@
     preview.innerHTML = `<span class="overlay-type">${escapeHtml(overlay.type || "overlay")}</span>
       <strong>${escapeHtml(overlay.headline || "")}</strong>
       <span>${escapeHtml(overlay.body || "")}</span>
-      <small>${escapeHtml(overlay.start_tc || "")} · ${escapeHtml(overlay.source_agent || "")}</small>`;
+      <small>${escapeHtml(overlay.start_tc || "")} · ${escapeHtml(overlay.source_agent || "")}${Number.isFinite(overlayLatency) ? ` · ${Math.round(overlayLatency)} ms` : ""}</small>`;
     $("#overlay-json").textContent = JSON.stringify(overlay, null, 2);
   }
 

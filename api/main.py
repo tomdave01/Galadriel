@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -133,9 +134,11 @@ class ReplayManager:
         *,
         state: MatchState | None = None,
         match_clock: float | None = None,
+        event_wall_time: datetime | None = None,
     ) -> None:
         settings = self.settings()
         state = state or self.state
+        emitted_from = event_wall_time or self._last_record_wall_time
         match_id = (
             str(state.events[-1].get("match_id") or "")
             if state.events
@@ -147,23 +150,18 @@ class ReplayManager:
         moments = facts.get("moments")
         fact_moments = moments if isinstance(moments, list) else []
         if not fact_moments:
-            fact_moments = [
-                {
-                    "id": stable_fact_id("match-state", facts),
-                    "type": "match_update",
-                    "minute": state.minute,
-                    "why": (
-                        f"Rovers {state.score.get('Rovers', 0)} — "
-                        f"{state.score.get('United', 0)} United"
-                    ),
-                    "team": None,
-                    "player": None,
-                }
-            ]
+            if self._loop is not None and not self._loop.is_closed():
+                snapshot = self.compact_snapshot({"facts": facts})
+                self._loop.call_soon_threadsafe(self._fanout, snapshot)
+            return
 
         for moment in fact_moments[:3]:
             fact_id = str(moment.get("id") or stable_fact_id("fact", moment))
             headline, body, agent_name = self._fact_copy(moment, state)
+            latency_ms = max(
+                0.0,
+                (datetime.now(timezone.utc) - emitted_from).total_seconds() * 1000,
+            )
             markings = []
             event = next(
                 (
@@ -187,6 +185,7 @@ class ReplayManager:
                 "start_tc": match_timecode(current_match_clock),
                 "duration_ms": 8_000,
                 "priority": 80 if moment.get("type") == "goal" else 50,
+                "latency_ms": latency_ms,
                 "mode": settings["mode"],
                 "language": settings["language"],
                 "headline": headline,
@@ -204,12 +203,43 @@ class ReplayManager:
                 "source_agent": agent_name,
                 "fact_ids": [fact_id],
             })
+            self.overlay_latency_ms = latency_ms
             self._publish_overlay(overlay)
 
-        self._update_overlay_latency()
         if self._loop is not None and not self._loop.is_closed():
             snapshot = self.compact_snapshot({"facts": facts})
             self._loop.call_soon_threadsafe(self._fanout, snapshot)
+            state_snapshot = copy.deepcopy(state)
+            self._loop.call_soon_threadsafe(
+                self._schedule_flagged_agent_tasks,
+                state_snapshot,
+                settings,
+                current_match_clock,
+                emitted_from,
+            )
+
+    def _schedule_flagged_agent_tasks(
+        self,
+        state: MatchState,
+        settings: dict[str, Any],
+        match_clock: float,
+        event_wall_time: datetime,
+    ) -> None:
+        analysis_task = asyncio.create_task(
+            self._run_live_agent_analysis(state, settings["mode"])
+        )
+        self._agent_tasks.add(analysis_task)
+        analysis_task.add_done_callback(self._finish_narration_task)
+        narration_task = asyncio.create_task(
+            self._narrate_live_update(
+                state,
+                settings,
+                match_clock,
+                event_wall_time,
+            )
+        )
+        self._agent_tasks.add(narration_task)
+        narration_task.add_done_callback(self._finish_narration_task)
 
     @staticmethod
     def _fact_copy(moment: dict[str, Any], state: MatchState) -> tuple[str, str, str]:
@@ -237,11 +267,18 @@ class ReplayManager:
         *,
         state: MatchState | None = None,
         match_clock: float | None = None,
+        event_wall_time: datetime | None = None,
     ) -> None:
         state = state or self.state
+        emitted_from = event_wall_time or self._last_record_wall_time
         current_match_clock = (
             self.match_clock if match_clock is None else max(0.0, match_clock)
         )
+        latency_ms = max(
+            0.0,
+            (datetime.now(timezone.utc) - emitted_from).total_seconds() * 1000,
+        )
+        self.overlay_latency_ms = latency_ms
         overlay = self.overlays.add({
             "type": "narration",
             "match_id": (
@@ -253,6 +290,7 @@ class ReplayManager:
             "start_tc": match_timecode(current_match_clock),
             "duration_ms": 9_000,
             "priority": 40,
+            "latency_ms": latency_ms,
             "mode": narration.get("mode", self.mode),
             "language": narration.get("language", self.language),
             "headline": (
@@ -279,6 +317,7 @@ class ReplayManager:
         self._last_record_wall_time = datetime.fromisoformat(
             message.wall_time_utc.replace("Z", "+00:00")
         ).astimezone(timezone.utc)
+        event_wall_time = self._last_record_wall_time
         self._fanout(self.compact_snapshot())
         if message.kind != "event":
             return
@@ -288,19 +327,8 @@ class ReplayManager:
             facts,
             state=state,
             match_clock=message.match_clock,
+            event_wall_time=event_wall_time,
         )
-        settings = self.settings()
-        if facts.get("moments"):
-            analysis_task = asyncio.create_task(
-                self._run_live_agent_analysis(state, settings["mode"])
-            )
-            self._agent_tasks.add(analysis_task)
-            analysis_task.add_done_callback(self._finish_narration_task)
-        task = asyncio.create_task(
-            self._narrate_live_update(state, settings, message.match_clock)
-        )
-        self._agent_tasks.add(task)
-        task.add_done_callback(self._finish_narration_task)
 
     async def _run_live_agent_analysis(
         self,
@@ -318,6 +346,7 @@ class ReplayManager:
         state: MatchState,
         settings: dict[str, Any],
         match_clock: float,
+        event_wall_time: datetime,
     ) -> None:
         narration = await self.orchestrator.narrator.narrate(
             state,
@@ -330,6 +359,7 @@ class ReplayManager:
             narration,
             state=state,
             match_clock=match_clock,
+            event_wall_time=event_wall_time,
         )
         self._fanout(self.compact_snapshot())
 
@@ -381,12 +411,6 @@ class ReplayManager:
             await self.webpubsub_sink.close()
             self.webpubsub_sink = None
 
-    def _update_overlay_latency(self) -> None:
-        self.overlay_latency_ms = max(
-            0.0,
-            (datetime.now(timezone.utc) - self._last_record_wall_time).total_seconds() * 1000,
-        )
-
     def _fanout_message(self, message: str) -> None:
         for queue in tuple(self._subscribers):
             if queue.full():
@@ -434,6 +458,7 @@ class ReplayManager:
             speed=self.speed,
             on_tick=self.publish_from_worker,
             on_fact=self.publish_facts_from_worker,
+            defer_model_calls=True,
             stop_event=self._stop_event,
             config_provider=self.settings,
             on_record=self._on_replay_record,
@@ -566,6 +591,7 @@ manager = ReplayManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    initialize_telemetry()
     manager._loop = asyncio.get_running_loop()
     feed_stop: asyncio.Event | None = None
     feed_task: asyncio.Task[None] | None = None
@@ -621,7 +647,6 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Overseer", version="0.1.0", lifespan=lifespan)
-initialize_telemetry()
 _cors_origins = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")

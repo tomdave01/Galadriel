@@ -9,6 +9,7 @@ from agents.narrator import Narrator
 from engine.replay import ReplayDataset, ReplayEngine
 from engine.state import MatchState, ingest
 from feed.persistence import InMemoryNarrationCache
+from llm.foundry import ask
 import pytest
 
 
@@ -158,6 +159,77 @@ def test_narrator_uses_templated_fallback_after_timeout():
     assert result["text"]
 
 
+def test_ask_returns_fallback_on_timeout_and_agent_exception():
+    class BrokenAgent:
+        async def run(self, _prompt: str) -> str:
+            raise RuntimeError("request failed")
+
+    timeout_result = asyncio.run(
+        ask(
+            _FakeAgent("too late", delay=0.05),
+            "prompt",
+            timeout=0.001,
+            fallback="timeout fallback",
+        )
+    )
+    error_result = asyncio.run(
+        ask(BrokenAgent(), "prompt", fallback="error fallback")
+    )
+
+    assert timeout_result == "timeout fallback"
+    assert error_result == "error fallback"
+
+
+def test_traced_agent_span_records_name_facts_and_latency(monkeypatch):
+    import telemetry
+
+    class FakeSpan:
+        def __init__(self) -> None:
+            self.attributes: dict[str, object] = {}
+
+        def __enter__(self) -> "FakeSpan":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_attribute(self, name: str, value: object) -> None:
+            self.attributes[name] = value
+
+        def record_exception(self, _error: Exception) -> None:
+            pass
+
+        def set_status(self, _status: object) -> None:
+            pass
+
+    class FakeTracer:
+        def __init__(self, span: FakeSpan) -> None:
+            self.span = span
+            self.name = ""
+
+        def start_as_current_span(self, name: str) -> FakeSpan:
+            self.name = name
+            return self.span
+
+    span = FakeSpan()
+    tracer = FakeTracer(span)
+    monkeypatch.setattr(telemetry.trace, "get_tracer", lambda _name: tracer)
+
+    result = asyncio.run(
+        telemetry.traced(
+            "ShapeAnalyst",
+            ("fact-1",),
+            asyncio.sleep(0, result="grounded"),
+        )
+    )
+
+    assert result == "grounded"
+    assert tracer.name == "agent.ShapeAnalyst"
+    assert span.attributes["agent.name"] == "ShapeAnalyst"
+    assert span.attributes["fact.ids"] == ["fact-1"]
+    assert span.attributes["agent.latency_ms"] >= 0
+
+
 def test_narrator_content_safety_replaces_rejected_output(monkeypatch):
     monkeypatch.setenv("AZURE_CONTENT_SAFETY_ENABLED", "1")
     monkeypatch.setattr("agents.narrator.narrator_output_is_safe", lambda text: not text)
@@ -250,8 +322,18 @@ def test_orchestrator_keeps_deterministic_analysis_and_template_fallback():
     assert state.moments[0]["type"] == "goal"
 
 
+def test_orchestrator_skips_narration_for_unflagged_state():
+    agent = _FakeAgent("must not be called")
+    orchestrator = Orchestrator(narrator=Narrator(agent=agent))
+
+    result = asyncio.run(orchestrator.tick_async(MatchState()))
+
+    assert result["narration"] is None
+    assert agent.calls == 0
+
+
 def test_orchestrator_yields_facts_before_starting_narrator():
-    state = MatchState()
+    state = MatchState(events=[_event("Rovers", "Rico Vale", "goal", minute=1)])
     agent = _FakeAgent("Grounded generated narration.")
     orchestrator = Orchestrator(narrator=Narrator(agent=agent))
 
@@ -294,6 +376,7 @@ def test_replay_engine_emits_facts_before_narration():
         ReplayDataset(
             name="single",
             source="synthetic",
+            events=[_event("Rovers", "Rico Vale", "goal")],
             frames=[{
                 "t": 0.0,
                 "minute": 0.0,

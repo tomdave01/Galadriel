@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from engine.state import MatchState
 from llm.client import create_foundry_chat_client
-from telemetry import traced_agent_call
+from telemetry import traced, traced_agent_call
 
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,11 @@ class FanCurator:
                         fact_ids=(context_id,),
                     ) as span:
                         response = await asyncio.wait_for(
-                            agent.run(prompt),
+                            traced(
+                                "FanCurator",
+                                (context_id,),
+                                agent.run(prompt),
+                            ),
                             timeout=self.timeout_seconds,
                         )
                         parsed = FanQueryFilters.model_validate_json(response.text)

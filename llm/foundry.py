@@ -12,6 +12,7 @@ from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
+from telemetry import traced
 
 
 load_dotenv()
@@ -67,10 +68,21 @@ async def ask(
     prompt: str,
     timeout: float = 6.0,
     fallback: str = "",
+    *,
+    agent_name: str | None = None,
+    fact_ids: Sequence[str] = (),
 ) -> str:
     """Run an agent with a deadline, returning its text or the fallback."""
     try:
-        result = await asyncio.wait_for(agent.run(prompt), timeout=timeout)
+        name = agent_name or str(getattr(agent, "name", "agent"))
+
+        async def run_agent() -> Any:
+            return await agent.run(prompt)
+
+        result = await asyncio.wait_for(
+            traced(name, fact_ids, run_agent()),
+            timeout=timeout,
+        )
         return str(result)
     except Exception as error:
         print(f"[foundry] fell back: {error.__class__.__name__}")

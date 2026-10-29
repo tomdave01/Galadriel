@@ -63,6 +63,7 @@ class ReplayEngine:
         tick_interval: float = 2.5,
         on_tick: TickCallback | None = None,
         on_fact: FactCallback | None = None,
+        defer_model_calls: bool = False,
         stop_event: threading.Event | None = None,
         config_provider: Callable[[], dict[str, Any]] | None = None,
         on_record: Callable[[str, dict[str, Any]], None] | None = None,
@@ -77,6 +78,7 @@ class ReplayEngine:
         self.tick_interval = tick_interval
         self.on_tick = on_tick
         self.on_fact = on_fact
+        self.defer_model_calls = defer_model_calls
         self.stop_event = stop_event or threading.Event()
         self.config_provider = config_provider
         self.on_record = on_record
@@ -157,25 +159,33 @@ class ReplayEngine:
         if self.on_fact:
             facts = self.orchestrator.analyze_facts(self.state)
             self.on_fact(facts)
-            agent_answers = (
-                asyncio.run(
-                    self.orchestrator.run_routed_agents(
-                        self.state,
-                        mode=mode,
+            if self.defer_model_calls:
+                agent_answers = {}
+                narration = None
+            else:
+                agent_answers = (
+                    asyncio.run(
+                        self.orchestrator.run_routed_agents(
+                            self.state,
+                            mode=mode,
+                        )
                     )
+                    if facts.get("moments")
+                    else {}
                 )
-                if facts.get("moments")
-                else {}
-            )
-            narration = asyncio.run(
-                self.orchestrator.narrator.narrate(
-                    self.state,
-                    mode=mode,
-                    language=language,
-                    favourite_team=favourite_team,
-                    favourite_player=favourite_player,
+                narration = (
+                    asyncio.run(
+                        self.orchestrator.narrator.narrate(
+                            self.state,
+                            mode=mode,
+                            language=language,
+                            favourite_team=favourite_team,
+                            favourite_player=favourite_player,
+                        )
+                    )
+                    if facts.get("moments")
+                    else None
                 )
-            )
             result = {
                 **facts,
                 "impact": self.state.impact,

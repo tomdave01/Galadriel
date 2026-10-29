@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
-from api.main import app, manager
+from api.main import ReplayManager, app, manager
 from api.overlays import OverlayHistory
-from engine.state import MatchState
+from engine.state import MatchState, ingest
+from feed.models import FeedMessage
 
 
 def test_static_dashboard_and_state_route():
@@ -112,6 +117,138 @@ def test_fact_overlay_is_validated_and_available_to_late_joiners():
     finally:
         manager.state = original_state
         manager.overlays = original_history
+
+
+def test_flagged_fact_overlay_precedes_async_narration_and_includes_latency():
+    async def run() -> list:
+        replay = ReplayManager()
+        replay._loop = asyncio.get_running_loop()
+        published = []
+        replay._publish_overlay = published.append
+
+        class DelayedNarrator:
+            async def narrate(self, *_args, **_kwargs) -> dict:
+                await asyncio.sleep(0.05)
+                return {
+                    "fact_id": "goal-rovers-1",
+                    "mode": "Broadcast",
+                    "language": "English",
+                    "favourite_team": "Rovers",
+                    "facts": {},
+                    "text": "GOAL for Rovers.",
+                    "fallback": False,
+                }
+
+        async def run_agents(*_args, **_kwargs) -> dict:
+            return {}
+
+        replay.orchestrator = SimpleNamespace(
+            analyze_facts=lambda _state: {
+                "moments": [{
+                    "id": "goal-rovers-1",
+                    "type": "goal",
+                    "team": "Rovers",
+                    "player": "Rico Vale",
+                    "why": "Rico Vale scored for Rovers.",
+                }]
+            },
+            run_routed_agents=run_agents,
+            narrator=DelayedNarrator(),
+        )
+        state = MatchState(
+            minute=1.0,
+            events=[{
+                "match_id": "match-1",
+                "player": "Rico Vale",
+                "team": "Rovers",
+                "x": 80.0,
+                "y": 45.0,
+            }],
+        )
+        wall_time = datetime.now(timezone.utc) - timedelta(milliseconds=100)
+        message = FeedMessage(
+            match_id="match-1",
+            seq=1,
+            match_clock=60.0,
+            wall_time_utc=wall_time.isoformat(),
+            source="synthetic",
+            payload={"kind": "event", "record": {"type": "shot"}},
+        )
+
+        await replay.on_feed_update(message, state)
+        assert [overlay.type for overlay in published] == ["fact"]
+        assert published[0].latency_ms is not None
+        assert published[0].latency_ms >= 90
+
+        async def wait_for_narration() -> None:
+            while len(published) < 2:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(wait_for_narration(), timeout=1)
+        await asyncio.gather(*tuple(replay._agent_tasks))
+        assert [overlay.type for overlay in published] == ["fact", "narration"]
+        assert published[1].latency_ms >= published[0].latency_ms
+        return published
+
+    published = asyncio.run(run())
+    assert published[0].headline.startswith("GOAL")
+    assert published[1].body == "GOAL for Rovers."
+
+
+def test_feed_update_survives_missing_foundry_configuration(monkeypatch):
+    async def run() -> list:
+        replay = ReplayManager()
+        replay._loop = asyncio.get_running_loop()
+        state = MatchState()
+        ingest(
+            state,
+            event={
+                "match_id": "match-1",
+                "clip_id": None,
+                "source": "synthetic",
+                "minute": 1.0,
+                "t": None,
+                "type": "shot",
+                "team": "Rovers",
+                "player": "Rico Vale",
+                "outcome": "goal",
+                "x": 80.0,
+                "y": 45.0,
+                "end_x": None,
+                "end_y": None,
+            },
+        )
+        wall_time = datetime.now(timezone.utc)
+        message = FeedMessage(
+            match_id="match-1",
+            seq=1,
+            match_clock=60.0,
+            wall_time_utc=wall_time.isoformat(),
+            source="synthetic",
+            payload={
+                "kind": "event",
+                "record": {"type": "shot", "outcome": "goal"},
+            },
+        )
+
+        await replay.on_feed_update(message, state)
+        assert [overlay.type for overlay in replay.overlays.recent()] == ["fact"]
+        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(replay._agent_tasks)),
+            timeout=2,
+        )
+        return replay.overlays.recent()
+
+    monkeypatch.delenv("FOUNDRY_PROJECT_ENDPOINT", raising=False)
+    monkeypatch.delenv("FOUNDRY_MODEL", raising=False)
+    monkeypatch.delenv("APPLICATIONINSIGHTS_CONNECTION_STRING", raising=False)
+    import llm.foundry
+
+    monkeypatch.setattr(llm.foundry, "_client", None)
+    overlays = asyncio.run(run())
+    assert [overlay.type for overlay in overlays] == ["fact", "narration"]
+    assert "Rico Vale scores for Rovers" in overlays[1].body
 
 
 def test_control_preferences_and_fan_query():
