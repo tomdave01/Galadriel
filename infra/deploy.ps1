@@ -3,7 +3,10 @@ $ErrorActionPreference = "Stop"
 # Edit these values before deployment. FoundryProjectScope is the ARM resource ID
 # of the Foundry project, not the project endpoint URL.
 $ResourceGroupName = "overseer-rg"
-$Region = "eastus2"
+$Region = "eastus"
+# Static Web Apps is not available in eastus; use a supported region separately.
+# Available regions: centralus, eastus2, westus2, westeurope, eastasia
+$StaticWebAppRegion = "eastus2"
 $ContainerAppName = "overseer-api"
 $StaticWebAppName = "overseer-web"
 $FoundryProjectScope = "/subscriptions/d6e4e6dc-d576-4acd-955e-865ce88d5452/resourceGroups/overseer-rg/providers/Microsoft.CognitiveServices/accounts/Overseer1-resource/projects/Overseer1"
@@ -241,7 +244,7 @@ $null = Invoke-Az @(
     "staticwebapp", "create",
     "--name", $StaticWebAppName,
     "--resource-group", $ResourceGroupName,
-    "--location", $Region,
+    "--location", $StaticWebAppRegion,
     "--sku", "Free",
     "--only-show-errors", "--output", "none"
 )
