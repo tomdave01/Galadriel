@@ -5,4 +5,7 @@ __pycache__
 .pytest_cache
 tests
 clips
+.env
+.env.*
+!.env.example
 outputs/*_annotated.mp4
