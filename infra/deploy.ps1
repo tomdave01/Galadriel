@@ -6,7 +6,7 @@ $ResourceGroupName = "overseer-rg"
 $Region = "eastus2"
 $ContainerAppName = "overseer-api"
 $StaticWebAppName = "overseer-web"
-$FoundryProjectScope = ""
+$FoundryProjectScope = "/subscriptions/d6e4e6dc-d576-4acd-955e-865ce88d5452/resourceGroups/overseer-rg/providers/Microsoft.CognitiveServices/accounts/Overseer1-resource/projects/Overseer1"
 $FoundryUserRoleDefinitionId = "53ca6127-db72-4b80-b1b0-d745d6d5456d"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -54,11 +54,19 @@ function Invoke-Az {
         [switch]$CaptureOutput
     )
 
+    # Use Continue so that az WARNING/INFO lines written to stderr do not
+    # trigger a terminating error under $ErrorActionPreference = "Stop".
+    # Exit-code checking below is the authoritative failure signal.
+    $local:ErrorActionPreference = "Continue"
     $output = & az @Arguments 2>&1
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         $commandName = ($Arguments | Select-Object -First 2) -join " "
-        throw "Azure CLI command 'az $commandName' failed with exit code $exitCode. Review Azure CLI configuration and permissions; output was suppressed to avoid exposing configuration values."
+        $errorDetail = ($output | Where-Object { $_ -match "ERROR:" }) -join [Environment]::NewLine
+        if ([string]::IsNullOrWhiteSpace($errorDetail)) {
+            $errorDetail = ($output -join [Environment]::NewLine).Trim()
+        }
+        throw "Azure CLI command 'az $commandName' failed with exit code $exitCode.`n$errorDetail"
     }
     if ($CaptureOutput) {
         return ($output -join [Environment]::NewLine).Trim()
@@ -123,27 +131,59 @@ $null = Invoke-Az @(
     "--only-show-errors", "--output", "none"
 )
 
-Write-Host "Building and deploying the backend Container App..."
+# ACR Tasks are blocked by subscription policy, so we build the image locally,
+# push it to ACR, and deploy with --image instead of --source.
+# Derive a deterministic, registry-name-safe ACR name (alphanumeric, 5-50 chars).
+$AcrName = ($ResourceGroupName -replace "[^a-zA-Z0-9]", "").ToLower() + "acr"
+if ($AcrName.Length -gt 50) { $AcrName = $AcrName.Substring(0, 50) }
+
+Write-Host "Creating the Azure Container Registry if needed..."
+$null = Invoke-Az @(
+    "acr", "create",
+    "--name", $AcrName,
+    "--resource-group", $ResourceGroupName,
+    "--sku", "Basic",
+    "--admin-enabled", "true",
+    "--only-show-errors", "--output", "none"
+)
+
+Write-Host "Logging in to ACR..."
+$local:ErrorActionPreference = "Continue"
+& az acr login --name $AcrName
+if ($LASTEXITCODE -ne 0) { throw "ACR login failed." }
+
+$ImageTag = "$AcrName.azurecr.io/${ContainerAppName}:latest"
+
+Write-Host "Building the Docker image locally..."
 Push-Location $RepoRoot
 try {
-    $null = Invoke-Az @(
-        "containerapp", "up",
-        "--name", $ContainerAppName,
-        "--resource-group", $ResourceGroupName,
-        "--location", $Region,
-        "--source", ".",
-        "--ingress", "external",
-        "--target-port", "8000",
-        "--env-vars",
-        "FOUNDRY_PROJECT_ENDPOINT=$FoundryProjectEndpoint",
-        "FOUNDRY_MODEL=$FoundryModel",
-        "APPLICATIONINSIGHTS_CONNECTION_STRING=$ApplicationInsightsConnectionString",
-        "--only-show-errors", "--output", "none"
-    )
+    $local:ErrorActionPreference = "Continue"
+    & docker build -t $ImageTag .
+    if ($LASTEXITCODE -ne 0) { throw "docker build failed." }
+
+    Write-Host "Pushing the image to ACR..."
+    & docker push $ImageTag
+    if ($LASTEXITCODE -ne 0) { throw "docker push failed." }
 }
 finally {
     Pop-Location
 }
+
+Write-Host "Deploying the backend Container App..."
+$null = Invoke-Az @(
+    "containerapp", "up",
+    "--name", $ContainerAppName,
+    "--resource-group", $ResourceGroupName,
+    "--location", $Region,
+    "--image", $ImageTag,
+    "--registry-server", "$AcrName.azurecr.io",
+    "--ingress", "external",
+    "--target-port", "8000",
+    "--env-vars",
+    "FOUNDRY_PROJECT_ENDPOINT=$FoundryProjectEndpoint",
+    "FOUNDRY_MODEL=$FoundryModel",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING=$ApplicationInsightsConnectionString"
+)
 
 Write-Host "Assigning a system-managed identity and granting Foundry project access..."
 $null = Invoke-Az @(
