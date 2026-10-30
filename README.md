@@ -1,10 +1,14 @@
 # Overseer
 
+<<<<<<< HEAD
 Overseer is a multi-agent football match-intelligence platform using synthetic
 match data. Its deterministic analysis tools produce grounded facts; Microsoft
 Agent Framework agents use Microsoft Foundry for optional interpretation and
 narration. The API emits fact overlays before asynchronous narration so model
 latency does not hold up the match feed.
+=======
+Overseer is a multi-agent match-intelligence platform. Specialist agents analyse team shape, pressing, patterns of play, player influence and momentum from a live event feed, writing structured, traceable facts into a shared state. A grounded Narrator renders them as timecoded broadcast overlays and personalised, multilingual commentary for broadcast, analyst and fan modes, on Microsoft Foundry and Azure.
+>>>>>>> 97c9c6a95b96881b763bb878fcc79da9fe324dc5
 
 ## Architecture
 
